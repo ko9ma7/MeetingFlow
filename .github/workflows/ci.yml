@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Restore
+        run: dotnet restore .\MeetingFlow.slnx
+
+      - name: Build
+        run: dotnet build .\MeetingFlow.slnx -c Release --no-restore
+
+      - name: Test
+        run: dotnet test .\MeetingFlow.slnx -c Release --no-build
+
+      - name: Validate Python syntax
+        run: python -m py_compile .\python-stt\meetingflow_stt.py
+

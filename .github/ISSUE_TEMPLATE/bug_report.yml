@@ -1,0 +1,53 @@
+name: 버그 신고
+description: 재현 가능한 오류를 알려 주세요.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 실제 회의 오디오, 전사 원문, API 키와 개인정보는 첨부하지 마세요.
+  - type: input
+    id: version
+    attributes:
+      label: MeetingFlow 버전
+      placeholder: 1.9.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 버전
+      placeholder: Windows 11 23H2
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: 입력 방식
+      options:
+        - 마이크
+        - 시스템 소리 루프백
+        - 오디오 파일
+        - 해당 없음
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 재현 절차
+      description: 민감한 내용을 제거한 재현 절차를 적어 주세요.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 기대 결과
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 실제 결과
+    validations:
+      required: true
+

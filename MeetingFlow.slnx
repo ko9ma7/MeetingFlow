@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="MeetingFlow.App/MeetingFlow.App.csproj" />
+  <Project Path="MeetingFlow.Tests/MeetingFlow.Tests.csproj" />
+</Solution>
