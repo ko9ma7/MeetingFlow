@@ -11,6 +11,10 @@ public sealed class AppSettings
     public string ContentProfile { get; set; } = TranscriptionProfileCatalog.DefaultId;
     public string WhisperModel { get; set; } = "medium";
     public string SttEngine { get; set; } = "python-faster-whisper";
+    public string CrisperModel { get; set; } = "small";
+    public string CrisperMode { get; set; } = "intended";
+    public int CrisperChunkMinutes { get; set; } = 1;
+    public bool KeepDualTranscripts { get; set; } = true;
     public bool EnableLiveDraft { get; set; } = true;
     public string LiveDraftModel { get; set; } = "base";
     public string SttQualityProfile { get; set; } = SttQualityPresetCatalog.DefaultId;

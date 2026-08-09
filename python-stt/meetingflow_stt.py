@@ -9,6 +9,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import wave
 from array import array
 from pathlib import Path
@@ -38,6 +39,20 @@ def sanitize_transcript_text(value: str) -> str:
     if not meaningful or (len(meaningful) >= 8 and len(set(meaningful)) <= 2):
         return ""
     return text
+
+
+def is_repeated_segment(value: str, recent: list[str]) -> bool:
+    normalized = re.sub(r"[^\w]", "", value, flags=re.UNICODE).lower()
+    if len(normalized) < 6:
+        return False
+    if any(normalized == re.sub(r"[^\w]", "", item, flags=re.UNICODE).lower() for item in recent[-6:]):
+        return True
+    words = re.findall(r"[\w]+", value.lower(), flags=re.UNICODE)
+    if len(words) >= 8:
+        window = " ".join(words[:4])
+        if window and " ".join(words).count(window) >= 3:
+            return True
+    return False
 
 
 def require_pyaudio():
@@ -185,6 +200,23 @@ def analyze_audio(audio_path: str) -> dict[str, object]:
         return {"rms_db": 0.0, "peak_db": 0.0, "clipping_percent": 0.0, "warning": f"음질 분석 생략: {exc}"}
 
 
+def decode_audio_mono_16k(audio_path: str):
+    import av
+    import numpy as np
+
+    resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
+    samples = []
+    with av.open(audio_path) as container:
+        for frame in container.decode(audio=0):
+            for converted in resampler.resample(frame):
+                samples.append(converted.to_ndarray().reshape(-1).astype(np.float32, copy=False))
+        for converted in resampler.resample(None):
+            samples.append(converted.to_ndarray().reshape(-1).astype(np.float32, copy=False))
+    if not samples:
+        raise RuntimeError("오디오 샘플을 읽지 못했습니다.")
+    return np.concatenate(samples)
+
+
 def assign_speakers(audio_path: str, segments: list[dict[str, object]], mode: str, speaker_count: int) -> tuple[int, str, str]:
     if mode == "off":
         return 0, "사용 안 함", ""
@@ -236,6 +268,7 @@ def is_model_prepared(model_dir: str, model: str) -> bool:
 
 
 def transcribe(audio_path: str, model: str, language: str, language_mode: str, model_dir: str, beam_size: int, initial_prompt: str, hotwords: str, content_profile: str, quality_profile: str, hallucination_guard: bool, diarization_mode: str, speaker_count: int) -> None:
+    started_at = time.perf_counter()
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
@@ -254,22 +287,31 @@ def transcribe(audio_path: str, model: str, language: str, language_mode: str, m
         "vad_parameters": vad_settings(quality_profile),
         "beam_size": max(1, beam_size),
         "patience": 1.2,
-        "condition_on_previous_text": True,
+        "condition_on_previous_text": False,
         "initial_prompt": initial_prompt or None,
         "hotwords": hotwords or None,
         "temperature": 0.0,
         "word_timestamps": True,
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.0,
+        "no_speech_threshold": 0.6,
     }
     if hallucination_guard:
         options.update({"repetition_penalty": 1.05, "hallucination_silence_threshold": 2.0})
     segments, info = engine.transcribe(audio_path, **options)
     duration = max(float(getattr(info, "duration", 0.0) or 0.0), 0.001)
     result_segments: list[dict[str, object]] = []
+    recent_texts: list[str] = []
+    rejected_repetitions = 0
     stream_segments = diarization_mode == "off"
     for segment in segments:
         text = sanitize_transcript_text(segment.text)
         if not text:
             continue
+        if hallucination_guard and is_repeated_segment(text, recent_texts):
+            rejected_repetitions += 1
+            continue
+        recent_texts.append(text)
         item = {"start": float(segment.start), "end": float(segment.end), "text": text, "speaker": ""}
         result_segments.append(item)
         segment_progress = min(0.03 + (float(segment.end) / duration) * 0.89, 0.92)
@@ -290,12 +332,17 @@ def transcribe(audio_path: str, model: str, language: str, language_mode: str, m
                 percent=0.97,
             )
     language_probs = getattr(info, "all_language_probs", None) or []
+    if rejected_repetitions:
+        emit("warning", message=f"반복·환각 의심 구간 {rejected_repetitions}개를 제외했습니다")
+    processing_seconds = time.perf_counter() - started_at
     emit(
         "complete",
         segments=len(result_segments),
         language=getattr(info, "language", language),
         language_probability=float(getattr(info, "language_probability", 0.0) or 0.0),
         top_languages=[{"language": item[0], "probability": float(item[1])} for item in language_probs[:5]],
+        processing_seconds=round(processing_seconds, 2),
+        realtime_factor=round(duration / max(processing_seconds, 0.001), 2),
     )
 
 
@@ -311,6 +358,7 @@ def live_transcribe(model: str, language: str, language_mode: str, model_dir: st
     emit("live_ready", message=f"임시 자막 준비됨 · {model} · CPU {threads}스레드")
     last_clean_text = ""
     for line in sys.stdin:
+        path = ""
         try:
             request = json.loads(line)
             if request.get("command") == "stop":
@@ -319,6 +367,7 @@ def live_transcribe(model: str, language: str, language_mode: str, model_dir: st
                 continue
             path = str(request.get("path", ""))
             offset = float(request.get("start", 0.0))
+            chunk_started_at = time.perf_counter()
             segments, _ = engine.transcribe(
                 path,
                 language=language if language_mode == "fixed" and language != "auto" else None,
@@ -341,12 +390,93 @@ def live_transcribe(model: str, language: str, language_mode: str, model_dir: st
                 if clean_text and comparable != previous:
                     emit("live_segment", start=offset, end=offset + local_end, text=clean_text)
                     last_clean_text = clean_text
+            processing_seconds = time.perf_counter() - chunk_started_at
+            emit("live_chunk_done", processing_seconds=round(processing_seconds, 2), realtime_factor=round(max(local_end, 0.001) / max(processing_seconds, 0.001), 2))
             try:
                 Path(path).unlink(missing_ok=True)
             except OSError:
                 pass
         except Exception as exc:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
             emit("error", message=f"실시간 초안 구간 처리 실패: {exc}", type=type(exc).__name__)
+
+
+def crisper_transcribe(audio_path: str, model: str, language: str, mode: str, chunk_minutes: int) -> None:
+    try:
+        from crisperwhisper import CrisperWhisperModel
+    except ImportError as exc:
+        raise RuntimeError("CrisperWhisper가 설치되지 않았습니다. setup-python.ps1을 다시 실행하세요.") from exc
+
+    emit("audio_quality", **analyze_audio(audio_path))
+    emit("stage", name=f"CrisperWhisper 2.0 {model} 모델 준비 · CPU 정밀 후처리", percent=-1.0)
+    engine = CrisperWhisperModel(model, backend="transformers", device="cpu", compute_type="float32")
+    emit("stage", name="CrisperWhisper 장문 연속 전사 · 실시간 초안과 별도로 실행", percent=0.02)
+    started_at = time.perf_counter()
+    audio = decode_audio_mono_16k(audio_path)
+    duration = max(len(audio) / 16000.0, 0.001)
+    block_samples = max(1, min(chunk_minutes, 10)) * 60 * 16000
+    overlap_samples = 5 * 16000
+    starts = list(range(0, len(audio), max(block_samples - overlap_samples, 1)))
+    recent_texts: list[str] = []
+    rejected = 0
+    accepted = 0
+    detected_language = language
+    failed_blocks = 0
+    for block_index, sample_start in enumerate(starts):
+        sample_end = min(sample_start + block_samples, len(audio))
+        block_start = sample_start / 16000.0
+        try:
+            result = engine.transcribe(
+                audio[sample_start:sample_end],
+                sr=16000,
+                language=language if language != "auto" else "ko",
+                mode=mode,
+                longform_strategy="continuation",
+                timestamp_aware_drop=True,
+                temperature_fallback=True,
+                hallucination_mitigation=False,
+                early_eot_recovery=True,
+                word_timestamps=False,
+            )
+            detected_language = result.language
+            chunks = result.chunks or []
+            if not chunks:
+                chunks = [type("Chunk", (), {"start_sec": 0.0, "end_sec": result.duration, "text": result.text})()]
+            for chunk in chunks:
+                start = block_start + float(chunk.start_sec)
+                end = min(block_start + float(chunk.end_sec), duration)
+                if block_index > 0 and end <= block_start + 5.0:
+                    continue
+                text = sanitize_transcript_text(str(chunk.text))
+                if not text:
+                    continue
+                if is_repeated_segment(text, recent_texts):
+                    rejected += 1
+                    continue
+                recent_texts.append(text)
+                accepted += 1
+                emit("segment", start=start, end=end, text=text, speaker="", percent=min(0.03 + end / duration * 0.93, 0.96))
+        except Exception as exc:
+            failed_blocks += 1
+            emit("warning", message=f"{block_start / 60:.1f}분 구간 처리 실패 · 다음 구간을 계속합니다: {exc}")
+        if sample_end >= len(audio):
+            break
+    if rejected:
+        emit("warning", message=f"CrisperWhisper 반복·환각 의심 구간 {rejected}개를 제외했습니다")
+    if failed_blocks:
+        emit("warning", message=f"전체 {len(starts)}개 장문 구간 중 {failed_blocks}개가 실패했습니다. 성공 구간은 보존했습니다")
+    processing_seconds = time.perf_counter() - started_at
+    emit(
+        "complete",
+        segments=accepted,
+        language=detected_language,
+        language_probability=0.0,
+        processing_seconds=round(processing_seconds, 2),
+        realtime_factor=round(duration / max(processing_seconds, 0.001), 2),
+    )
 
 
 def health() -> None:
@@ -365,10 +495,16 @@ def health() -> None:
     emit("health", **result)
 
 
+def crisper_health() -> None:
+    available = importlib.util.find_spec("crisperwhisper") is not None and importlib.util.find_spec("av") is not None
+    emit("crisper_health", python=sys.version.split()[0], crisperwhisper=available)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("health")
+    sub.add_parser("crisper-health")
     sub.add_parser("devices")
     record = sub.add_parser("record")
     record.add_argument("--output", required=True)
@@ -394,13 +530,21 @@ def main() -> int:
     live.add_argument("--language-mode", choices=["fixed", "auto", "mixed"], default="fixed")
     live.add_argument("--model-dir", required=True)
     live.add_argument("--quality-profile", choices=["cpu-fast", "cpu-accurate", "cpu-maximum"], default="cpu-accurate")
+    crisper = sub.add_parser("crisper-transcribe")
+    crisper.add_argument("--input", required=True)
+    crisper.add_argument("--model", choices=["small", "medium", "turbo", "large"], default="small")
+    crisper.add_argument("--language", default="ko")
+    crisper.add_argument("--mode", choices=["intended", "verbatim"], default="intended")
+    crisper.add_argument("--chunk-minutes", type=int, default=5)
     args = parser.parse_args()
     try:
         if args.command == "health": health()
+        elif args.command == "crisper-health": crisper_health()
         elif args.command == "devices": list_devices()
         elif args.command == "record": record_audio(args.output, args.device, args.live_preview)
         elif args.command == "transcribe": transcribe(args.input, args.model, args.language, args.language_mode, args.model_dir, args.beam_size, args.initial_prompt, args.hotwords, args.content_profile, args.quality_profile, args.hallucination_guard, args.diarization_mode, args.speaker_count)
         elif args.command == "live": live_transcribe(args.model, args.language, args.language_mode, args.model_dir, args.quality_profile)
+        elif args.command == "crisper-transcribe": crisper_transcribe(args.input, args.model, args.language, args.mode, args.chunk_minutes)
         return 0
     except Exception as exc:
         emit("error", message=str(exc), type=type(exc).__name__)

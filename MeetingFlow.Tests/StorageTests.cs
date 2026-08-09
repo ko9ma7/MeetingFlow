@@ -13,7 +13,7 @@ public sealed class StorageTests : IDisposable
     {
         var service = new SettingsService(_root);
         var protectedKey = SettingsService.ProtectApiKey("test-secret-key");
-        service.Save(new AppSettings { ProtectedApiKey = protectedKey, Model = "gemini-test", Temperature = 0.4, ShowTimelineEditor = false, AutoRetryPendingAi = false, GeminiConnectionTimeoutSeconds = 15, RequireTranscriptReviewBeforeAi = true, EnableLiveDraft = true, LiveDraftModel = "medium", SttQualityProfile = "cpu-accurate", SpeakerDiarizationMode = "fixed", SpeakerCount = 3 });
+        service.Save(new AppSettings { ProtectedApiKey = protectedKey, Model = "gemini-test", Temperature = 0.4, ShowTimelineEditor = false, AutoRetryPendingAi = false, GeminiConnectionTimeoutSeconds = 15, RequireTranscriptReviewBeforeAi = true, EnableLiveDraft = true, LiveDraftModel = "base", SttQualityProfile = "cpu-accurate", SttEngine = "hybrid-compare", CrisperModel = "small", CrisperMode = "intended", CrisperChunkMinutes = 2, SpeakerDiarizationMode = "fixed", SpeakerCount = 3 });
 
         var loaded = service.Load();
 
@@ -26,7 +26,11 @@ public sealed class StorageTests : IDisposable
         Assert.Equal(15, loaded.GeminiConnectionTimeoutSeconds);
         Assert.True(loaded.RequireTranscriptReviewBeforeAi);
         Assert.True(loaded.EnableLiveDraft);
-        Assert.Equal("medium", loaded.LiveDraftModel);
+        Assert.Equal("base", loaded.LiveDraftModel);
+        Assert.Equal("hybrid-compare", loaded.SttEngine);
+        Assert.Equal("small", loaded.CrisperModel);
+        Assert.Equal("intended", loaded.CrisperMode);
+        Assert.Equal(2, loaded.CrisperChunkMinutes);
         Assert.Equal("cpu-accurate", loaded.SttQualityProfile);
         Assert.Equal("fixed", loaded.SpeakerDiarizationMode);
         Assert.Equal(3, loaded.SpeakerCount);
@@ -55,6 +59,11 @@ public sealed class StorageTests : IDisposable
             ExpectedSpeakerCount = 2,
             DetectedSpeakerCount = 2,
             DiarizationStatus = "완료",
+            SecondaryTranscript = "보조 회의 전사",
+            SttComparisonSummary = "1개 시간 구간 비교",
+            SttDisagreementCount = 0,
+            SttProcessingSeconds = 12.3,
+            SttRealtimeFactor = 2.1,
             TranscriptSegments = [new TranscriptSegment { Start = TimeSpan.Zero, End = TimeSpan.FromSeconds(3), Speaker = "A", Text = "회의 전사" }],
             Summary = new MeetingSummary { Overview = "요약" }
         };
@@ -76,6 +85,8 @@ public sealed class StorageTests : IDisposable
         Assert.Equal(2, loaded[0].DetectedSpeakerCount);
         Assert.Equal("A", loaded[0].TranscriptSegments[0].Speaker);
         Assert.Equal("cpu-accurate", loaded[0].SttQualityProfile);
+        Assert.Equal("보조 회의 전사", loaded[0].SecondaryTranscript);
+        Assert.Equal(2.1, loaded[0].SttRealtimeFactor);
         var jsonBytes = File.ReadAllBytes(Path.Combine(_root, "Meetings", $"{meeting.Id}.json"));
         Assert.False(jsonBytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }));
         Assert.Contains("회의 전사", System.Text.Encoding.UTF8.GetString(jsonBytes));
@@ -133,7 +144,7 @@ public sealed class StorageTests : IDisposable
 
         Assert.Equal("cpu-accurate", migrated.Id);
         Assert.Equal("medium", accurate.FinalModel);
-        Assert.Equal("medium", accurate.LiveModel);
+        Assert.Equal("base", accurate.LiveModel);
         Assert.Equal(5, accurate.BeamSize);
         Assert.Contains(SttQualityPresetCatalog.All, x => x.Id == "cpu-maximum" && x.FinalModel == "large-v3-turbo");
         Assert.Equal("media", TranscriptionProfileCatalog.Get("media").Id);
@@ -179,6 +190,27 @@ public sealed class StorageTests : IDisposable
     public void LiveTranscriptSanitizer_RemovesLowInformationRepetition(string input, string expected)
     {
         Assert.Equal(expected, TranscriptTextSanitizer.SanitizeLiveSegment(input));
+    }
+
+    [Fact]
+    public void TranscriptComparison_FlagsTimeAlignedDisagreement()
+    {
+        var primary = new[]
+        {
+            new TranscriptSegment { Start = TimeSpan.Zero, End = TimeSpan.FromSeconds(5), Text = "오늘 예산을 확정했습니다" },
+            new TranscriptSegment { Start = TimeSpan.FromSeconds(5), End = TimeSpan.FromSeconds(10), Text = "납기는 다음 주입니다" }
+        };
+        var secondary = new[]
+        {
+            new TranscriptSegment { Start = TimeSpan.Zero, End = TimeSpan.FromSeconds(5), Text = "오늘 예산을 확정했습니다" },
+            new TranscriptSegment { Start = TimeSpan.FromSeconds(5), End = TimeSpan.FromSeconds(10), Text = "완전히 다른 내용" }
+        };
+
+        var result = TranscriptComparisonService.Compare(primary, secondary);
+
+        Assert.Equal(2, result.ComparedSegments);
+        Assert.Equal(1, result.DisagreementCount);
+        Assert.Contains("검토 필요 1개", result.Summary);
     }
 
     public void Dispose()

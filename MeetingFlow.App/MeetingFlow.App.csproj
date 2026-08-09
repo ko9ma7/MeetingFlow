@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
-    <Version>1.9.0</Version>
+    <Version>2.0.0</Version>
     <ApplicationIcon></ApplicationIcon>
     <AssemblyName>MeetingFlow</AssemblyName>
   </PropertyGroup>
@@ -22,6 +22,7 @@
   <ItemGroup>
     <Content Include="..\python-stt\meetingflow_stt.py" Link="python-stt\meetingflow_stt.py" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\python-stt\requirements.txt" Link="python-stt\requirements.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\python-stt\requirements-crisper.txt" Link="python-stt\requirements-crisper.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

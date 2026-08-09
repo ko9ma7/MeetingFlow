@@ -2,7 +2,7 @@ namespace MeetingFlow.App.Models;
 
 public sealed class MeetingRecord
 {
-    public int DataVersion { get; set; } = 7;
+    public int DataVersion { get; set; } = 8;
     public Guid Id { get; set; } = Guid.NewGuid();
     public string Title { get; set; } = string.Empty;
     public string MeetingType { get; set; } = "일반 업무 회의";
@@ -17,6 +17,13 @@ public sealed class MeetingRecord
     public DateTime? TranscriptReviewedAt { get; set; }
     public string AiNotesText { get; set; } = string.Empty;
     public List<TranscriptSegment> TranscriptSegments { get; set; } = [];
+    public string SecondaryTranscript { get; set; } = string.Empty;
+    public List<TranscriptSegment> SecondaryTranscriptSegments { get; set; } = [];
+    public string SttComparisonSummary { get; set; } = string.Empty;
+    public int SttDisagreementCount { get; set; }
+    public double SttProcessingSeconds { get; set; }
+    public double SttRealtimeFactor { get; set; }
+    public string SttWarnings { get; set; } = string.Empty;
     public string SttEngine { get; set; } = "Whisper.net / whisper.cpp";
     public string SttModel { get; set; } = string.Empty;
     public string SttQualityProfile { get; set; } = SttQualityPresetCatalog.DefaultId;
@@ -81,6 +88,9 @@ public sealed class LocalTranscript
     public int DetectedSpeakerCount { get; set; }
     public string DiarizationStatus { get; set; } = "사용 안 함";
     public string DiarizationWarning { get; set; } = string.Empty;
+    public double ProcessingSeconds { get; set; }
+    public double RealtimeFactor { get; set; }
+    public List<string> Warnings { get; set; } = [];
     public string Text => string.Join(Environment.NewLine, Segments.Select(x => $"[{x.Timestamp}] {x.SpeakerPrefix}{x.Text.Trim()}"));
 }
 

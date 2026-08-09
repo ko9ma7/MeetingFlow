@@ -9,6 +9,7 @@ artifacts/
 publish/
 
 python-stt/.venv/
+python-stt/.crisper-venv/
 **/__pycache__/
 *.py[cod]
 

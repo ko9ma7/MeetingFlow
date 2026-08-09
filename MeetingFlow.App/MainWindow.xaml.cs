@@ -31,12 +31,16 @@ public partial class MainWindow : Window
     private bool _isBusy;
     private CancellationTokenSource? _processingCts;
     private bool _pythonReady;
+    private bool _crisperReady;
     private bool _preparedAudioIsImported;
     private IReadOnlyList<PythonAudioDevice> _pythonDevices = [];
     private MeetingRecord? _activeRecord;
     private readonly StringBuilder _liveDraftText = new();
     private DateTime _lastLiveCheckpointSavedAt;
+    private DateTime _lastSttCheckpointSavedAt;
     private string _lastLiveSegmentText = string.Empty;
+    private readonly StringBuilder _sttDiagnostics = new();
+    private string _lastSttLogMessage = string.Empty;
 
     public MainWindow()
     {
@@ -47,7 +51,7 @@ public partial class MainWindow : Window
         TemperatureSlider.ValueChanged += (_, _) => TemperatureValue.Text = TemperatureSlider.Value.ToString("0.0");
         _pythonStt.LevelChanged += (_, level) => Dispatcher.InvokeAsync(() => LevelMeter.Value = Math.Min(1, level * 3.2));
         _pythonStt.LiveDraftReceived += (_, segment) => Dispatcher.InvokeAsync(() => AppendLiveDraft(segment));
-        _pythonStt.LiveDraftStatusChanged += (_, status) => Dispatcher.InvokeAsync(() => LiveDraftStatusText.Text = status);
+        _pythonStt.LiveDraftStatusChanged += (_, status) => Dispatcher.InvokeAsync(() => { LiveDraftStatusText.Text = status; AppendSttLog(status); });
         Loaded += async (_, _) => await InitializePythonAsync();
         Closing += (_, _) => { _recorder.Dispose(); _pythonStt.Dispose(); };
         LoadAppState();
@@ -102,8 +106,11 @@ public partial class MainWindow : Window
         LanguageModeBox.SelectedIndex = _settings.LanguageMode switch { "auto" => 1, "mixed" => 2, _ => 0 };
         ReportLanguageBox.SelectedIndex = _settings.ReportLanguage switch { "ko-KR" => 1, "en-US" => 2, "zh-CN" => 3, "ja-JP" => 4, "de-DE" => 5, "fr-FR" => 6, _ => 0 };
         WhisperModelBox.SelectedIndex = _settings.WhisperModel switch { "tiny" => 0, "base" => 1, "small" => 2, "large-v3" => 4, "large-v3-turbo" => 5, _ => 3 };
-        SttEngineBox.SelectedIndex = _settings.SttEngine == "csharp-whispernet" ? 1 : 0;
+        SttEngineBox.SelectedIndex = _settings.SttEngine switch { "python-crisperwhisper" => 1, "hybrid-compare" => 2, "csharp-whispernet" => 3, _ => 0 };
         LiveDraftModelBox.SelectedIndex = _settings.LiveDraftModel switch { "tiny" => 0, "small" => 2, "medium" => 3, _ => 1 };
+        CrisperModelBox.SelectedIndex = _settings.CrisperModel switch { "medium" => 1, "turbo" => 2, "large" => 3, _ => 0 };
+        CrisperModeBox.SelectedIndex = _settings.CrisperMode == "verbatim" ? 1 : 0;
+        CrisperChunkMinutesBox.SelectedIndex = _settings.CrisperChunkMinutes switch { 2 => 1, 5 => 2, 10 => 3, _ => 0 };
         SpeakerModeBox.SelectedIndex = _settings.SpeakerDiarizationMode switch { "auto" => 1, "fixed" => 2, _ => 0 };
         SpeakerCountBox.Text = _settings.SpeakerCount.ToString();
         HomeSpeakerModeBox.SelectedIndex = SpeakerModeBox.SelectedIndex;
@@ -149,13 +156,41 @@ public partial class MainWindow : Window
                 ? "pyannote Community-1 엔진 설치됨 · Hugging Face 토큰 설정 후 사용 가능"
                 : "화자 분리는 선택 기능입니다 · pyannote.audio 설치와 Hugging Face 토큰이 필요합니다";
             FooterStatus.Text = "Python 로컬 음성 엔진 준비됨";
+            AppendSttLog($"faster-whisper 준비 · Python {health.Python}");
         }
         catch (Exception ex)
         {
             _pythonReady = false;
             WhisperModelStatusText.Text = $"Python 엔진 미사용 · C# Whisper 폴백: {ex.Message}";
+            AppendSttLog($"faster-whisper 미사용 · {ex.Message}");
+        }
+        try
+        {
+            var crisper = await _pythonStt.GetCrisperHealthAsync();
+            _crisperReady = crisper.CrisperWhisper;
+            CrisperStatusText.Text = _crisperReady
+                ? $"CrisperWhisper 2.0 준비 · Python {crisper.Python} · CPU 정밀 후처리 전용"
+                : "CrisperWhisper 미설치 · scripts/setup-python.ps1 실행 필요";
+            AppendSttLog(_crisperReady ? $"CrisperWhisper 준비 · Python {crisper.Python}" : "CrisperWhisper 전용 환경 미설치");
+        }
+        catch (Exception ex)
+        {
+            _crisperReady = false;
+            CrisperStatusText.Text = $"CrisperWhisper 미사용 · {ex.Message}";
+            AppendSttLog($"CrisperWhisper 확인 실패 · {ex.Message}");
         }
         RefreshApiStatus();
+    }
+
+    private void AppendSttLog(string message)
+    {
+        if (string.Equals(message, _lastSttLogMessage, StringComparison.Ordinal)) return;
+        _lastSttLogMessage = message;
+        _sttDiagnostics.Append('[').Append(DateTime.Now.ToString("HH:mm:ss")).Append("] ").AppendLine(message);
+        if (_sttDiagnostics.Length > 12000) _sttDiagnostics.Remove(0, _sttDiagnostics.Length - 8000);
+        if (SttDiagnosticsBox is null) return;
+        SttDiagnosticsBox.Text = _sttDiagnostics.ToString();
+        SttDiagnosticsBox.ScrollToEnd();
     }
 
     private void AudioSourceBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -258,6 +293,7 @@ public partial class MainWindow : Window
     private void AboutNav_Click(object sender, RoutedEventArgs e) => ShowPage(AboutPage, "앱 정보", AboutNav);
     private void ShowTranscriptReview_Click(object sender, RoutedEventArgs e) => ResultTabs.SelectedIndex = 0;
     private void ShowAiReport_Click(object sender, RoutedEventArgs e) => ResultTabs.SelectedIndex = 1;
+    private void ShowSttComparison_Click(object sender, RoutedEventArgs e) => ResultTabs.SelectedIndex = 2;
 
     private void NewMeetingButton_Click(object sender, RoutedEventArgs e)
     {
@@ -271,6 +307,9 @@ public partial class MainWindow : Window
         TimerText.Text = "00:00:00";
         TranscriptBox.Text = "녹음하거나 오디오 파일을 가져오면 로컬 STT 원문이 여기에 표시됩니다.";
         SummaryBox.Text = "Gemini 정리를 사용하면 회의 요약, 결정사항과 실행 항목이 여기에 표시됩니다.";
+        ComparisonSummaryText.Text = "이중 검증 엔진을 선택하면 시간 구간별 일치도를 표시합니다.";
+        SecondaryTranscriptBox.Text = "보조 전사 결과가 여기에 별도로 보존됩니다.";
+        RecordingConsentBox.IsChecked = false;
         _activeRecord = null;
         _preparedAudioIsImported = false;
         SaveTranscriptButton.IsEnabled = false;
@@ -296,6 +335,11 @@ public partial class MainWindow : Window
     private async void RecordButton_Click(object sender, RoutedEventArgs e)
     {
         if (_isBusy || DeviceBox.SelectedIndex < 0) return;
+        if (RecordingConsentBox.IsChecked != true)
+        {
+            ShowError("녹음 동의를 확인하세요", "참석자에게 녹음과 전사 사실을 알린 뒤 확인란을 선택하세요.");
+            return;
+        }
         try
         {
             var audioFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MeetingFlow", "Audio");
@@ -466,6 +510,16 @@ public partial class MainWindow : Window
         _processingCts?.Dispose();
         _processingCts = new CancellationTokenSource();
         var token = _processingCts.Token;
+        if (_activeRecord is null || !string.Equals(_activeRecord.AudioPath, audioPath, StringComparison.OrdinalIgnoreCase))
+        {
+            _activeRecord = CreateRecordingCheckpoint(audioPath, _preparedAudioIsImported ? DateTime.Now : _recordingStarted);
+            _activeRecord.AudioSource = _preparedAudioIsImported ? "오디오 파일 가져오기" : _activeRecord.AudioSource;
+        }
+        _activeRecord.Duration = duration;
+        _activeRecord.ProcessingStatus = "STT 처리 중 · 구간별 자동 저장";
+        _activeRecord.AiStatus = "STT 처리 중";
+        await Task.Run(() => _repository.Save(_activeRecord), token);
+        _lastSttCheckpointSavedAt = DateTime.Now;
         WorkspaceTabs.SelectedIndex = 1;
         ResultTabs.SelectedIndex = 0;
         SetBusy(true, "2/3  저장된 전체 음성을 자동으로 정밀 보정합니다…");
@@ -476,21 +530,76 @@ public partial class MainWindow : Window
                 ProcessingProgressBar.IsIndeterminate = update.Percent < 0;
                 if (update.Percent >= 0) ProcessingProgressBar.Value = update.Percent;
                 ProgressText.Text = update.Percent < 0 ? $"2/3  {update.Stage}" : $"2/3  {update.Stage}  {update.Percent:P0}";
+                AppendSttLog(update.Stage);
                 if (!string.IsNullOrWhiteSpace(update.PartialTranscript))
                 {
                     TranscriptBox.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#172033"));
                     TranscriptBox.Text = update.PartialTranscript;
                     TranscriptBox.ScrollToEnd();
                     TranscriptCount.Text = $"{update.PartialTranscript.Length:N0}자";
+                    if (_activeRecord is not null && DateTime.Now - _lastSttCheckpointSavedAt >= TimeSpan.FromSeconds(15))
+                    {
+                        _activeRecord.Transcript = update.PartialTranscript;
+                        _activeRecord.RawTranscript = update.PartialTranscript;
+                        _activeRecord.ProcessingStatus = $"STT 처리 중 · {Math.Max(update.Percent, 0):P0} · 부분 결과 자동 저장";
+                        _repository.Save(_activeRecord);
+                        _lastSttCheckpointSavedAt = DateTime.Now;
+                    }
                 }
             });
             var contentProfile = TranscriptionProfileCatalog.Get(GetContentProfileId());
             var speakerMode = GetComboTag(HomeSpeakerModeBox, _settings.SpeakerDiarizationMode);
             var speakerCount = ParseSpeakerCount(HomeSpeakerCountBox.Text);
-            var usePython = _pythonReady && _settings.SttEngine != "csharp-whispernet";
-            var localTranscript = usePython
-                ? await _pythonStt.TranscribeAsync(audioPath, _settings.WhisperModel, _settings.Language, _settings.LanguageMode, _settings.AllowedLanguages, contentProfile.Id, _settings.SttQualityProfile, _settings.SttBeamSize, _settings.SttVocabulary, _settings.UseCustomVocabulary, _settings.EnableHallucinationGuard, speakerMode, speakerCount, SettingsService.UnprotectApiKey(_settings.ProtectedHuggingFaceToken), progress, token)
-                : await _localStt.TranscribeAsync(audioPath, _settings.WhisperModel, _settings.LanguageMode == "fixed" ? _settings.Language : "auto", progress, token);
+            var selectedEngine = _settings.SttEngine;
+            LocalTranscript localTranscript;
+            LocalTranscript? secondaryTranscript = null;
+            TranscriptComparisonResult? comparison = null;
+            var engineLabel = "Whisper.net / whisper.cpp";
+            var modelLabel = _settings.WhisperModel;
+            if (selectedEngine == "csharp-whispernet" || (!_pythonReady && selectedEngine != "python-crisperwhisper"))
+            {
+                localTranscript = await _localStt.TranscribeAsync(audioPath, _settings.WhisperModel, _settings.LanguageMode == "fixed" ? _settings.Language : "auto", progress, token);
+            }
+            else if (selectedEngine == "python-crisperwhisper")
+            {
+                if (!_crisperReady) throw new InvalidOperationException("CrisperWhisper 전용 환경이 준비되지 않았습니다. 설정 화면의 설치 상태를 확인하세요.");
+                localTranscript = await _pythonStt.TranscribeCrisperAsync(audioPath, _settings.CrisperModel, _settings.Language, _settings.CrisperMode, _settings.CrisperChunkMinutes, progress, token);
+                engineLabel = "CrisperWhisper 2.0 / Transformers CPU";
+                modelLabel = _settings.CrisperModel;
+            }
+            else if (selectedEngine == "hybrid-compare")
+            {
+                var fastTranscript = await _pythonStt.TranscribeAsync(audioPath, _settings.WhisperModel, _settings.Language, _settings.LanguageMode, _settings.AllowedLanguages, contentProfile.Id, _settings.SttQualityProfile, _settings.SttBeamSize, _settings.SttVocabulary, _settings.UseCustomVocabulary, _settings.EnableHallucinationGuard, speakerMode, speakerCount, SettingsService.UnprotectApiKey(_settings.ProtectedHuggingFaceToken), progress, token);
+                localTranscript = fastTranscript;
+                engineLabel = "이중 검증 / faster-whisper + CrisperWhisper 2.0";
+                modelLabel = $"{_settings.WhisperModel} + {_settings.CrisperModel}";
+                if (_crisperReady)
+                {
+                    try
+                    {
+                        var crisperTranscript = await _pythonStt.TranscribeCrisperAsync(audioPath, _settings.CrisperModel, _settings.Language, _settings.CrisperMode, _settings.CrisperChunkMinutes, progress, token);
+                        if (crisperTranscript.Segments.Count > 0)
+                        {
+                            localTranscript = crisperTranscript;
+                            secondaryTranscript = fastTranscript;
+                            localTranscript.ProcessingSeconds += fastTranscript.ProcessingSeconds;
+                            localTranscript.RealtimeFactor = duration.TotalSeconds / Math.Max(localTranscript.ProcessingSeconds, 0.001);
+                            comparison = TranscriptComparisonService.Compare(localTranscript.Segments, secondaryTranscript.Segments);
+                        }
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        localTranscript.Warnings.Add($"Crisper 비교 전사 실패 · faster-whisper 결과로 안전하게 완료: {ex.Message}");
+                        engineLabel += " (Crisper 실패 · 빠른 결과 보존)";
+                    }
+                }
+                else localTranscript.Warnings.Add("Crisper 전용 환경이 없어 faster-whisper 결과만 저장했습니다.");
+            }
+            else
+            {
+                localTranscript = await _pythonStt.TranscribeAsync(audioPath, _settings.WhisperModel, _settings.Language, _settings.LanguageMode, _settings.AllowedLanguages, contentProfile.Id, _settings.SttQualityProfile, _settings.SttBeamSize, _settings.SttVocabulary, _settings.UseCustomVocabulary, _settings.EnableHallucinationGuard, speakerMode, speakerCount, SettingsService.UnprotectApiKey(_settings.ProtectedHuggingFaceToken), progress, token);
+                engineLabel = "Python faster-whisper / CTranslate2";
+            }
             var transcript = localTranscript.Text;
             if (localTranscript.Segments.Count == 0) throw new InvalidOperationException("음성을 인식하지 못했습니다. 입력 장치와 오디오 음량을 확인하세요.");
             TranscriptBox.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#172033"));
@@ -503,12 +612,16 @@ public partial class MainWindow : Window
             if (!string.IsNullOrWhiteSpace(localTranscript.LanguageConstraintWarning)) diagnostics.Add(localTranscript.LanguageConstraintWarning);
             if (!string.IsNullOrWhiteSpace(localTranscript.AudioQualityWarning)) diagnostics.Add(localTranscript.AudioQualityWarning);
             if (!string.IsNullOrWhiteSpace(localTranscript.DiarizationWarning)) diagnostics.Add(localTranscript.DiarizationWarning);
+            diagnostics.AddRange(localTranscript.Warnings);
+            if (localTranscript.RealtimeFactor > 0) diagnostics.Add($"처리 속도 {localTranscript.RealtimeFactor:0.0}x 실시간 · {localTranscript.ProcessingSeconds:0.0}초");
+            if (comparison is not null) diagnostics.Add(comparison.Summary);
             TranscriptCount.ToolTip = diagnostics.Count == 0 ? "STT 처리 완료" : string.Join(Environment.NewLine, diagnostics);
+            ComparisonSummaryText.Text = comparison?.Summary ?? "단일 엔진 전사입니다. 설정에서 '이중 검증'을 선택하면 두 결과를 시간 구간별로 비교합니다.";
+            SecondaryTranscriptBox.Text = secondaryTranscript?.Text ?? "보조 전사 결과 없음";
 
             var fullRange = startSeconds <= 0 && Math.Abs(endSeconds - duration.TotalSeconds) < 1.5;
             var rangeLabel = fullRange ? $"전체 원문 ({FormatClock(duration)})" : $"{FormatClock(TimeSpan.FromSeconds(startSeconds))} ~ {FormatClock(TimeSpan.FromSeconds(endSeconds))}";
-            var checkpoint = !_preparedAudioIsImported && _activeRecord is not null &&
-                             string.Equals(_activeRecord.AudioPath, audioPath, StringComparison.OrdinalIgnoreCase)
+            var checkpoint = _activeRecord is not null && string.Equals(_activeRecord.AudioPath, audioPath, StringComparison.OrdinalIgnoreCase)
                 ? _activeRecord
                 : null;
             var record = new MeetingRecord
@@ -520,8 +633,15 @@ public partial class MainWindow : Window
                 LiveDraftTranscript = checkpoint?.LiveDraftTranscript ?? _liveDraftText.ToString(),
                 LiveDraftUpdatedAt = checkpoint?.LiveDraftUpdatedAt,
                 TranscriptSegments = localTranscript.Segments,
-                SttEngine = usePython ? "Python faster-whisper / CTranslate2" : "Whisper.net / whisper.cpp",
-                SttModel = _settings.WhisperModel, SttQualityProfile = _settings.SttQualityProfile,
+                SecondaryTranscript = secondaryTranscript?.Text ?? string.Empty,
+                SecondaryTranscriptSegments = secondaryTranscript?.Segments ?? [],
+                SttComparisonSummary = comparison?.Summary ?? string.Empty,
+                SttDisagreementCount = comparison?.DisagreementCount ?? 0,
+                SttProcessingSeconds = localTranscript.ProcessingSeconds,
+                SttRealtimeFactor = localTranscript.RealtimeFactor,
+                SttWarnings = string.Join(Environment.NewLine, localTranscript.Warnings),
+                SttEngine = engineLabel,
+                SttModel = modelLabel, SttQualityProfile = _settings.SttQualityProfile,
                 LiveDraftModel = _settings.EnableLiveDraft ? _settings.LiveDraftModel : string.Empty,
                 SpeakerDiarizationMode = speakerMode, ExpectedSpeakerCount = speakerCount,
                 DetectedSpeakerCount = localTranscript.DetectedSpeakerCount, DiarizationStatus = localTranscript.DiarizationStatus,
@@ -546,7 +666,7 @@ public partial class MainWindow : Window
             GenerateAiButton.IsEnabled = aiMode != "사용 안 함";
             ReviewStatusText.Text = localTranscript.DiarizationStatus is "실패" or "미설치" or "미실행"
                 ? $"전체 음성 확정본 · 화자 분리 {localTranscript.DiarizationStatus} · 선택 범위는 AI 보고서에만 적용"
-                : "전체 음성 확정본입니다 · 내용을 확인한 뒤 저장하세요";
+                : comparison is not null ? $"전체 음성 확정본 · {comparison.Summary}" : "전체 음성 확정본입니다 · 내용을 확인한 뒤 저장하세요";
             SummaryBox.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#172033"));
             if (!_settings.RequireTranscriptReviewBeforeAi && _settings.AutoSummarize && aiMode != "사용 안 함")
             {
@@ -858,8 +978,8 @@ public partial class MainWindow : Window
             AudioPath = audioPath,
             ProcessingStatus = "녹음 중 · 자동 저장",
             AiStatus = "녹음 중",
-            SttEngine = "Python faster-whisper / CTranslate2",
-            SttModel = _settings.WhisperModel,
+            SttEngine = _settings.SttEngine switch { "python-crisperwhisper" => "CrisperWhisper 2.0 / Transformers CPU", "hybrid-compare" => "이중 검증 / faster-whisper + CrisperWhisper 2.0", "csharp-whispernet" => "Whisper.net / whisper.cpp", _ => "Python faster-whisper / CTranslate2" },
+            SttModel = _settings.SttEngine is "python-crisperwhisper" ? _settings.CrisperModel : _settings.SttEngine is "hybrid-compare" ? $"{_settings.WhisperModel} + {_settings.CrisperModel}" : _settings.WhisperModel,
             SttQualityProfile = _settings.SttQualityProfile,
             LiveDraftModel = _settings.EnableLiveDraft ? _settings.LiveDraftModel : string.Empty,
             ContentProfileId = profile.Id,
@@ -948,6 +1068,10 @@ public partial class MainWindow : Window
             ContentProfile = (ContentProfileBox.SelectedItem as TranscriptionProfile)?.Id ?? TranscriptionProfileCatalog.DefaultId,
             WhisperModel = GetComboTag(WhisperModelBox, "medium"),
             SttEngine = GetComboTag(SttEngineBox, "python-faster-whisper"),
+            CrisperModel = GetComboTag(CrisperModelBox, "small"),
+            CrisperMode = GetComboTag(CrisperModeBox, "intended"),
+            CrisperChunkMinutes = int.Parse(GetComboTag(CrisperChunkMinutesBox, "1")),
+            KeepDualTranscripts = true,
             EnableLiveDraft = EnableLiveDraftBox.IsChecked == true,
             LiveDraftModel = GetComboTag(LiveDraftModelBox, "base"),
             SttQualityProfile = SttQualityPresetCatalog.Get(_settings.SttQualityProfile).Id,
@@ -1098,7 +1222,7 @@ public partial class MainWindow : Window
         RecordRangeStartBox.Text = FormatClock(TimeSpan.FromSeconds(record.AiRangeStartSeconds > 0 ? record.AiRangeStartSeconds : record.AiRangeStartMinute * 60));
         var recordEnd = record.AiRangeEndSeconds > 0 ? TimeSpan.FromSeconds(record.AiRangeEndSeconds) : record.AiRangeEndMinute > 0 ? TimeSpan.FromMinutes(record.AiRangeEndMinute) : record.Duration;
         RecordRangeEndBox.Text = FormatClock(recordEnd);
-        RecordInfoBox.Text = $"제목: {record.Title}\n회의·콘텐츠 유형: {record.MeetingType}\nSTT 콘텐츠 프로필: {record.ContentProfileName}\n시작: {record.StartedAt:yyyy-MM-dd HH:mm:ss}\n완료: {record.CompletedAt:yyyy-MM-dd HH:mm:ss}\n길이: {record.DurationText}\n녹음 소스: {record.AudioSource}\n처리 상태: {record.ProcessingStatus}\nSTT 엔진: {record.SttEngine}\nCPU 품질 프리셋: {SttQualityPresetCatalog.Get(record.SttQualityProfile).Name}\n정확도 모델: {record.SttModel}\n실시간 임시 자막 모델: {(string.IsNullOrWhiteSpace(record.LiveDraftModel) ? "사용 안 함" : record.LiveDraftModel)}\n전사 검토: {(record.TranscriptReviewed ? $"완료 ({record.TranscriptReviewedAt:yyyy-MM-dd HH:mm:ss})" : "대기")}\n화자 분리: {record.DiarizationStatus} · 방식 {record.SpeakerDiarizationMode} · 감지 {record.DetectedSpeakerCount}명\n화자 분리 진단: {(string.IsNullOrWhiteSpace(record.DiarizationWarning) ? "정상" : record.DiarizationWarning)}\n언어 방식: {record.LanguageMode}\n주 언어: {record.PrimaryLanguage}\n감지 언어: {(string.IsNullOrWhiteSpace(record.DetectedLanguage) ? "고정 또는 정보 없음" : $"{record.DetectedLanguage} ({record.DetectedLanguageProbability:P0})")}\n언어 진단: {(string.IsNullOrWhiteSpace(record.LanguageConstraintWarning) ? "정상" : record.LanguageConstraintWarning)}\n평균/최대 음량: {record.AudioRmsDb:0.0} / {record.AudioPeakDb:0.0} dBFS\n음질 진단: {(string.IsNullOrWhiteSpace(record.AudioQualityWarning) ? "정상" : record.AudioQualityWarning)}\n보고서 유형: {record.ReportTemplateName}\nAI 정리 수준: {record.AiOrganizationMode}\nAI 상태: {record.AiStatus}\nAI 시도 횟수: {record.AiAttemptCount}\nAI 적용 범위: {record.AiSourceRange}\n마지막 AI 오류: {(string.IsNullOrWhiteSpace(record.AiLastError) ? "없음" : record.AiLastError)}\n데이터 버전: {record.DataVersion}\n문자 인코딩: {record.TextEncoding}\n오디오: {record.AudioPath}{encodingWarning}";
+        RecordInfoBox.Text = $"제목: {record.Title}\n회의·콘텐츠 유형: {record.MeetingType}\nSTT 콘텐츠 프로필: {record.ContentProfileName}\n시작: {record.StartedAt:yyyy-MM-dd HH:mm:ss}\n완료: {record.CompletedAt:yyyy-MM-dd HH:mm:ss}\n길이: {record.DurationText}\n녹음 소스: {record.AudioSource}\n처리 상태: {record.ProcessingStatus}\nSTT 엔진: {record.SttEngine}\nCPU 품질 프리셋: {SttQualityPresetCatalog.Get(record.SttQualityProfile).Name}\n정확도 모델: {record.SttModel}\n처리 속도: {(record.SttRealtimeFactor > 0 ? $"{record.SttRealtimeFactor:0.0}x 실시간 · {record.SttProcessingSeconds:0.0}초" : "기록 없음")}\n이중 전사 비교: {(string.IsNullOrWhiteSpace(record.SttComparisonSummary) ? "사용 안 함" : record.SttComparisonSummary)}\nSTT 경고: {(string.IsNullOrWhiteSpace(record.SttWarnings) ? "없음" : record.SttWarnings)}\n실시간 임시 자막 모델: {(string.IsNullOrWhiteSpace(record.LiveDraftModel) ? "사용 안 함" : record.LiveDraftModel)}\n전사 검토: {(record.TranscriptReviewed ? $"완료 ({record.TranscriptReviewedAt:yyyy-MM-dd HH:mm:ss})" : "대기")}\n화자 분리: {record.DiarizationStatus} · 방식 {record.SpeakerDiarizationMode} · 감지 {record.DetectedSpeakerCount}명\n화자 분리 진단: {(string.IsNullOrWhiteSpace(record.DiarizationWarning) ? "정상" : record.DiarizationWarning)}\n언어 방식: {record.LanguageMode}\n주 언어: {record.PrimaryLanguage}\n감지 언어: {(string.IsNullOrWhiteSpace(record.DetectedLanguage) ? "고정 또는 정보 없음" : $"{record.DetectedLanguage} ({record.DetectedLanguageProbability:P0})")}\n언어 진단: {(string.IsNullOrWhiteSpace(record.LanguageConstraintWarning) ? "정상" : record.LanguageConstraintWarning)}\n평균/최대 음량: {record.AudioRmsDb:0.0} / {record.AudioPeakDb:0.0} dBFS\n음질 진단: {(string.IsNullOrWhiteSpace(record.AudioQualityWarning) ? "정상" : record.AudioQualityWarning)}\n보고서 유형: {record.ReportTemplateName}\nAI 정리 수준: {record.AiOrganizationMode}\nAI 상태: {record.AiStatus}\nAI 시도 횟수: {record.AiAttemptCount}\nAI 적용 범위: {record.AiSourceRange}\n마지막 AI 오류: {(string.IsNullOrWhiteSpace(record.AiLastError) ? "없음" : record.AiLastError)}\n데이터 버전: {record.DataVersion}\n문자 인코딩: {record.TextEncoding}\n오디오: {record.AudioPath}{encodingWarning}";
         RecordInfoBox.Text += $"\n실시간 저장본: {record.LiveDraftTranscript.Length:N0}자 · 마지막 저장 {record.LiveDraftUpdatedAt:yyyy-MM-dd HH:mm:ss}\nAI 지침 버전: {record.AiPromptVersion}";
         RecordSummaryBox.Text = aiNotes;
         RecordTranscriptBox.Text = string.IsNullOrWhiteSpace(record.Transcript) ? rawTranscript : record.Transcript;
@@ -1115,6 +1239,8 @@ public partial class MainWindow : Window
         var content = $"# {record.Title}\n\n- 일시: {record.DisplayDate}\n- 유형: {record.MeetingType}\n- 길이: {record.DurationText}\n- STT: {record.SttEngine} / {record.SttModel}\n- 전사 검토: {(record.TranscriptReviewed ? "완료" : "대기")}\n- 화자 분리: {record.DiarizationStatus} / {record.DetectedSpeakerCount}명\n- AI 정리: {record.AiOrganizationMode} / {record.AiSourceRange}\n\n## AI 회의 노트\n\n{aiNotes}\n\n## 검토한 전사본\n\n{reviewedTranscript}\n\n## 변경되지 않는 STT 원본\n\n{rawTranscript}\n";
         if (!string.IsNullOrWhiteSpace(record.LiveDraftTranscript))
             content += $"\n## 녹음 중 자동 저장된 실시간 전사\n\n{record.LiveDraftTranscript}\n";
+        if (!string.IsNullOrWhiteSpace(record.SecondaryTranscript))
+            content += $"\n## 보조 STT 교차 검증본\n\n{record.SttComparisonSummary}\n\n{record.SecondaryTranscript}\n";
         File.WriteAllText(dialog.FileName, content, new UTF8Encoding(false));
         FooterStatus.Text = $"내보내기 완료 · {dialog.FileName}";
     }

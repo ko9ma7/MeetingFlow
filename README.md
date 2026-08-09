@@ -16,7 +16,7 @@
 - **Local-first:** 오디오, 실시간 초안, 확정 전사를 내 PC에 우선 저장합니다.
 - **Review-first AI:** AI가 잘못 들은 문장을 사실처럼 요약하기 전에 사용자가 원문을 검토합니다.
 - **No meeting bot:** Teams, Zoom, YouTube 등 PC에서 재생되는 소리를 WASAPI 루프백으로 기록할 수 있습니다.
-- **Open-source STT:** faster-whisper/CTranslate2를 기본으로 사용하고 Gemini는 보고서 작성에만 선택적으로 사용합니다.
+- **선택형 로컬 STT:** faster-whisper 빠른 확정, CrisperWhisper 2.0 정밀 후처리, 두 엔진 교차 검증을 선택합니다.
 - **Failure tolerant:** Gemini 연결이 끊겨도 녹음과 전사는 보존되며 나중에 다시 정리할 수 있습니다.
 
 ## 핵심 기능
@@ -24,6 +24,9 @@
 - PyAudio 마이크 녹음과 NAudio WASAPI 시스템 소리 루프백
 - 녹음 중 실시간 전사 초안과 로컬 체크포인트 저장
 - faster-whisper CPU `int8` 전사와 문장별 진행률
+- CrisperWhisper 2.0 `intended`/`verbatim` 정밀 전사와 1~10분 장문 안전 구간
+- 두 STT 결과의 시간 구간별 일치도, 보조 원문, 검토 필요 구간 보존
+- 실시간 처리 지연 시 무한 큐 대신 최신 구간을 건너뛰고 원본 오디오에서 종료 후 복구
 - 한국어, 영어, 중국어, 일본어, 독일어, 프랑스어 등 고정·자동·혼합 언어 모드
 - 뉴스, 기술 검토, 인터뷰, 강의, 고객 상담 등 콘텐츠 프로필
 - 원본 STT, 사용자 검토본, AI 보고서 분리 저장
@@ -39,9 +42,14 @@
 flowchart LR
     A[마이크 또는 시스템 소리] --> B[로컬 WAV 저장]
     B --> C[실시간 STT 초안]
-    B --> D[전체 음성 확정 전사]
+    B --> D{확정 엔진 선택}
+    D --> K[faster-whisper 빠른 확정]
+    D --> L[CrisperWhisper 정밀 확정]
+    D --> M[이중 전사 교차 검증]
     C --> E[로컬 체크포인트]
-    D --> F[사용자 검토와 수정]
+    K --> F[사용자 검토와 수정]
+    L --> F
+    M --> F
     F --> G{Gemini 사용?}
     G -- 아니요 --> H[로컬 기록과 내보내기]
     G -- 예 --> I[선택 범위 텍스트만 전송]
@@ -62,12 +70,14 @@ flowchart LR
 
 - Windows 10 또는 Windows 11 x64
 - [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)
-- Python 3.13
+- Python 3.13 (녹음·faster-whisper)과 Python 3.12 (CrisperWhisper 전용 격리 환경)
 - 마이크 또는 Windows 오디오 출력 장치
 - 모델 최초 다운로드를 위한 인터넷 연결
 - Gemini 보고서를 사용할 경우에만 Gemini API 키
 
 AMD GPU나 NVIDIA CUDA가 없어도 CPU로 동작합니다.
+
+CrisperWhisper의 Windows Transformers 백엔드는 CPU 실시간 엔진이 아닙니다. 녹음 중 `tiny`/`base` 초안을 저장하고 종료 후 정밀 확정하는 구성을 권장합니다. `small`은 가장 빠른 Crisper 선택이며 `medium` 이상은 정확도와 처리 시간을 함께 확인하세요.
 
 ## 빠른 시작
 
@@ -112,10 +122,10 @@ API 키는 Windows 사용자 계정의 DPAPI로 암호화해 로컬에 저장합
 ## 현재 한계
 
 - 설치 프로그램과 자동 업데이트는 아직 제공하지 않습니다.
-- 실시간 초안은 확정본이 아니며 녹음 종료 후 전체 전사 결과로 교체됩니다.
+- 실시간 초안은 확정본이 아니며 처리 속도가 실시간보다 느리면 일부 초안 구간을 건너뜁니다. 원본 오디오는 빠짐없이 저장되고 종료 후 확정합니다.
+- CrisperWhisper Windows CPU 처리는 모델·음성 길이에 따라 실시간보다 느릴 수 있습니다.
 - 화자 분리는 pyannote 설치와 Hugging Face 토큰이 필요하고 CPU에서 오래 걸릴 수 있습니다.
 - 겹쳐 말하기, 멀리 있는 마이크, 배경 음악, 작은 음량에서는 정확도가 낮아질 수 있습니다.
-- 30분 이상 장시간 녹음의 복구·메모리 테스트가 더 필요합니다.
 - Notion, Teams, Slack, 캘린더 직접 연동은 아직 구현되지 않았습니다.
 
 ## 로드맵

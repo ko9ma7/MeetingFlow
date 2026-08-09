@@ -9,17 +9,21 @@ public sealed record PythonHealth(string Python, bool PyAudio, bool FasterWhispe
 {
     public bool Ready => PyAudio && FasterWhisper;
 }
+public sealed record CrisperHealth(string Python, bool CrisperWhisper);
 public sealed record LiveDraftSegment(TimeSpan Start, TimeSpan End, string Text);
 
 public sealed class PythonSttService : IDisposable
 {
     private readonly string _scriptPath;
     private readonly string _pythonPath;
+    private readonly string _crisperPythonPath;
     private Process? _recordingProcess;
     private Task? _recordingReader;
     private Process? _liveProcess;
     private Task? _liveReader;
     private readonly SemaphoreSlim _liveInputLock = new(1, 1);
+    private int _liveChunkOutstanding;
+    private int _liveChunksSkipped;
     public event EventHandler<float>? LevelChanged;
     public event EventHandler<LiveDraftSegment>? LiveDraftReceived;
     public event EventHandler<string>? LiveDraftStatusChanged;
@@ -42,6 +46,9 @@ public sealed class PythonSttService : IDisposable
         var workspacePython = Path.Combine(workspaceFolder, ".venv", "Scripts", "python.exe");
         var outputPython = Path.Combine(AppContext.BaseDirectory, "python-stt", ".venv", "Scripts", "python.exe");
         _pythonPath = File.Exists(workspacePython) ? workspacePython : File.Exists(outputPython) ? outputPython : "py";
+        var workspaceCrisperPython = Path.Combine(workspaceFolder, ".crisper-venv", "Scripts", "python.exe");
+        var outputCrisperPython = Path.Combine(AppContext.BaseDirectory, "python-stt", ".crisper-venv", "Scripts", "python.exe");
+        _crisperPythonPath = File.Exists(workspaceCrisperPython) ? workspaceCrisperPython : File.Exists(outputCrisperPython) ? outputCrisperPython : string.Empty;
     }
 
     public async Task<PythonHealth> GetHealthAsync(CancellationToken token = default)
@@ -53,6 +60,16 @@ public sealed class PythonSttService : IDisposable
             root.TryGetProperty("pyaudio", out var pyaudio) && pyaudio.GetBoolean(),
             root.TryGetProperty("faster_whisper", out var whisper) && whisper.GetBoolean(),
             root.TryGetProperty("pyannote", out var pyannote) && pyannote.GetBoolean());
+    }
+
+    public async Task<CrisperHealth> GetCrisperHealthAsync(CancellationToken token = default)
+    {
+        if (string.IsNullOrWhiteSpace(_crisperPythonPath)) return new(string.Empty, false);
+        using var document = await RunSingleEventAsync("crisper-health", token, _crisperPythonPath);
+        var root = document.RootElement;
+        return new(
+            root.TryGetProperty("python", out var python) ? python.GetString() ?? string.Empty : string.Empty,
+            root.TryGetProperty("crisperwhisper", out var crisper) && crisper.GetBoolean());
     }
 
     public async Task<IReadOnlyList<PythonAudioDevice>> GetDevicesAsync(CancellationToken token = default)
@@ -163,6 +180,14 @@ public sealed class PythonSttService : IDisposable
                     transcript.LanguageConstraintWarning = $"감지 언어 '{transcript.DetectedLanguage}'가 허용 언어({string.Join(", ", allowed)})에 없습니다. 주 언어를 고정해 다시 처리하세요.";
                 else if (languageMode != "fixed" && transcript.LanguageProbability is > 0 and < 0.65)
                     transcript.LanguageConstraintWarning = $"언어 감지 신뢰도가 {transcript.LanguageProbability:P0}로 낮습니다. 주 언어 고정을 권장합니다.";
+                transcript.ProcessingSeconds = root.TryGetProperty("processing_seconds", out var processing) ? processing.GetDouble() : 0;
+                transcript.RealtimeFactor = root.TryGetProperty("realtime_factor", out var factor) ? factor.GetDouble() : 0;
+            }
+            else if (eventName == "warning")
+            {
+                var warningText = root.TryGetProperty("message", out var warning) ? warning.GetString() ?? string.Empty : string.Empty;
+                if (!string.IsNullOrWhiteSpace(warningText)) transcript.Warnings.Add(warningText);
+                progress?.Report(new SttProgress($"전사 진단 · {warningText}", 0.94, transcript.Text));
             }
             else if (eventName == "diarization")
             {
@@ -178,9 +203,56 @@ public sealed class PythonSttService : IDisposable
         return transcript;
     }
 
+    public async Task<LocalTranscript> TranscribeCrisperAsync(string audioPath, string modelName, string language, string mode, int chunkMinutes, IProgress<SttProgress>? progress = null, CancellationToken token = default)
+    {
+        if (string.IsNullOrWhiteSpace(_crisperPythonPath))
+            throw new InvalidOperationException("CrisperWhisper 전용 Python 3.12 환경이 없습니다. scripts/setup-python.ps1을 실행하세요.");
+        var info = CreateStartInfo(["crisper-transcribe", "--input", audioPath, "--model", modelName, "--language", LanguageCatalog.ToWhisperCode(language), "--mode", mode, "--chunk-minutes", Math.Clamp(chunkMinutes, 1, 10).ToString()], _crisperPythonPath);
+        using var process = Process.Start(info) ?? throw new InvalidOperationException("CrisperWhisper 프로세스를 시작하지 못했습니다.");
+        using var cancellation = token.Register(() => { try { if (!process.HasExited) process.Kill(true); } catch { } });
+        var standardError = process.StandardError.ReadToEndAsync(token);
+        var transcript = new LocalTranscript { DiarizationStatus = "Crisper 단독 전사 · 화자 구분 없음" };
+        while (await process.StandardOutput.ReadLineAsync(token) is { } line)
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            var eventName = root.GetProperty("event").GetString();
+            if (eventName == "stage") progress?.Report(new SttProgress(root.GetProperty("name").GetString() ?? "CrisperWhisper 준비", root.GetProperty("percent").GetDouble(), transcript.Text));
+            else if (eventName == "audio_quality")
+            {
+                transcript.AudioRmsDb = root.TryGetProperty("rms_db", out var rms) ? rms.GetDouble() : 0;
+                transcript.AudioPeakDb = root.TryGetProperty("peak_db", out var peak) ? peak.GetDouble() : 0;
+                transcript.AudioQualityWarning = root.TryGetProperty("warning", out var warning) ? warning.GetString() ?? string.Empty : string.Empty;
+            }
+            else if (eventName == "segment")
+            {
+                transcript.Segments.Add(new TranscriptSegment { Start = TimeSpan.FromSeconds(root.GetProperty("start").GetDouble()), End = TimeSpan.FromSeconds(root.GetProperty("end").GetDouble()), Text = root.GetProperty("text").GetString() ?? string.Empty });
+                progress?.Report(new SttProgress("CrisperWhisper 2.0 정밀 전사 중", root.GetProperty("percent").GetDouble(), transcript.Text));
+            }
+            else if (eventName == "warning")
+            {
+                var warningText = root.TryGetProperty("message", out var warning) ? warning.GetString() ?? string.Empty : string.Empty;
+                if (!string.IsNullOrWhiteSpace(warningText)) transcript.Warnings.Add(warningText);
+                progress?.Report(new SttProgress($"Crisper 진단 · {warningText}", 0.97, transcript.Text));
+            }
+            else if (eventName == "complete")
+            {
+                transcript.DetectedLanguage = root.TryGetProperty("language", out var detected) ? detected.GetString() ?? string.Empty : string.Empty;
+                transcript.ProcessingSeconds = root.TryGetProperty("processing_seconds", out var processing) ? processing.GetDouble() : 0;
+                transcript.RealtimeFactor = root.TryGetProperty("realtime_factor", out var factor) ? factor.GetDouble() : 0;
+            }
+            else if (eventName == "error") throw new InvalidOperationException(root.GetProperty("message").GetString());
+        }
+        await process.WaitForExitAsync(token);
+        if (process.ExitCode != 0) throw new InvalidOperationException(await standardError);
+        return transcript;
+    }
+
     public Task StartLivePreviewAsync(string modelName, string language, string languageMode, string qualityProfile, CancellationToken token = default)
     {
         if (IsLivePreviewRunning) return Task.CompletedTask;
+        Interlocked.Exchange(ref _liveChunkOutstanding, 0);
+        Interlocked.Exchange(ref _liveChunksSkipped, 0);
         var modelFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MeetingFlow", "Models", "faster-whisper");
         Directory.CreateDirectory(modelFolder);
         _liveProcess = Process.Start(CreateStartInfo("live", "--model", modelName, "--language", LanguageCatalog.ToWhisperCode(language), "--language-mode", languageMode, "--model-dir", modelFolder, "--quality-profile", SttQualityPresetCatalog.Get(qualityProfile).Id))
@@ -200,6 +272,13 @@ public sealed class PythonSttService : IDisposable
                         TimeSpan.FromSeconds(root.GetProperty("start").GetDouble()),
                         TimeSpan.FromSeconds(root.GetProperty("end").GetDouble()),
                         root.GetProperty("text").GetString() ?? string.Empty));
+                else if (eventName == "live_chunk_done")
+                {
+                    Interlocked.Exchange(ref _liveChunkOutstanding, 0);
+                    var rtf = root.TryGetProperty("realtime_factor", out var factor) ? factor.GetDouble() : 0;
+                    var skipped = Volatile.Read(ref _liveChunksSkipped);
+                    LiveDraftStatusChanged?.Invoke(this, skipped == 0 ? $"실시간 초안 · 처리 속도 {rtf:0.0}x" : $"실시간 초안 · {rtf:0.0}x · 지연 구간 {skipped}개는 종료 후 확정");
+                }
                 else if (eventName == "error")
                     LiveDraftStatusChanged?.Invoke(this, $"실시간 초안 중지 · {root.GetProperty("message").GetString()}");
             }
@@ -209,13 +288,32 @@ public sealed class PythonSttService : IDisposable
 
     public async Task SubmitLiveChunkAsync(string path, double startSeconds, CancellationToken token = default)
     {
-        if (!IsLivePreviewRunning || string.IsNullOrWhiteSpace(path) || _liveProcess is null) return;
-        await _liveInputLock.WaitAsync(token);
+        if (!IsLivePreviewRunning || string.IsNullOrWhiteSpace(path) || _liveProcess is null) { TryDelete(path); return; }
+        if (Interlocked.CompareExchange(ref _liveChunkOutstanding, 1, 0) != 0)
+        {
+            Interlocked.Increment(ref _liveChunksSkipped);
+            TryDelete(path);
+            LiveDraftStatusChanged?.Invoke(this, "실시간 처리보다 음성이 빨라 초안 구간을 건너뜁니다 · 녹음 원본은 보존되고 종료 후 확정됩니다");
+            return;
+        }
+        try { await _liveInputLock.WaitAsync(token); }
+        catch
+        {
+            Interlocked.Exchange(ref _liveChunkOutstanding, 0);
+            TryDelete(path);
+            throw;
+        }
         try
         {
             var payload = JsonSerializer.Serialize(new { command = "chunk", path, start = startSeconds });
             await _liveProcess.StandardInput.WriteLineAsync(payload);
             await _liveProcess.StandardInput.FlushAsync();
+        }
+        catch
+        {
+            Interlocked.Exchange(ref _liveChunkOutstanding, 0);
+            TryDelete(path);
+            throw;
         }
         finally { _liveInputLock.Release(); }
     }
@@ -228,6 +326,7 @@ public sealed class PythonSttService : IDisposable
             _liveProcess.Dispose();
             _liveProcess = null;
             _liveReader = null;
+            Interlocked.Exchange(ref _liveChunkOutstanding, 0);
             return;
         }
         try
@@ -243,12 +342,13 @@ public sealed class PythonSttService : IDisposable
             _liveProcess.Dispose();
             _liveProcess = null;
             _liveReader = null;
+            Interlocked.Exchange(ref _liveChunkOutstanding, 0);
         }
     }
 
-    private async Task<JsonDocument> RunSingleEventAsync(string command, CancellationToken token)
+    private async Task<JsonDocument> RunSingleEventAsync(string command, CancellationToken token, string? pythonPath = null)
     {
-        using var process = Process.Start(CreateStartInfo(command)) ?? throw new InvalidOperationException("Python 프로세스를 시작하지 못했습니다.");
+        using var process = Process.Start(CreateStartInfo([command], pythonPath ?? _pythonPath)) ?? throw new InvalidOperationException("Python 프로세스를 시작하지 못했습니다.");
         var line = await process.StandardOutput.ReadLineAsync(token) ?? throw new InvalidOperationException("Python에서 응답하지 않았습니다.");
         await process.WaitForExitAsync(token);
         var document = JsonDocument.Parse(line);
@@ -262,11 +362,14 @@ public sealed class PythonSttService : IDisposable
     }
 
     private ProcessStartInfo CreateStartInfo(params string[] arguments)
+        => CreateStartInfo(arguments, _pythonPath);
+
+    private ProcessStartInfo CreateStartInfo(IReadOnlyList<string> arguments, string pythonPath)
     {
         if (!File.Exists(_scriptPath)) throw new FileNotFoundException("Python STT 사이드카를 찾지 못했습니다.", _scriptPath);
         var info = new ProcessStartInfo
         {
-            FileName = _pythonPath,
+            FileName = pythonPath,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -275,13 +378,20 @@ public sealed class PythonSttService : IDisposable
             StandardOutputEncoding = System.Text.Encoding.UTF8,
             StandardErrorEncoding = System.Text.Encoding.UTF8
         };
-        if (_pythonPath.Equals("py", StringComparison.OrdinalIgnoreCase)) info.ArgumentList.Add("-3.13");
+        if (pythonPath.Equals("py", StringComparison.OrdinalIgnoreCase)) info.ArgumentList.Add("-3.13");
         info.Environment["PYTHONUTF8"] = "1";
         info.Environment["PYTHONIOENCODING"] = "utf-8";
         info.Environment["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1";
         info.ArgumentList.Add(_scriptPath);
         foreach (var argument in arguments) info.ArgumentList.Add(argument);
         return info;
+    }
+
+    private static void TryDelete(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return;
+        try { File.Delete(path); }
+        catch { }
     }
 
     public void Dispose()
