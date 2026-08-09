@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: MeetingFlow 버전
-      placeholder: 1.9.0
+      placeholder: 2.0.0
     validations:
       required: true
   - type: input
@@ -50,4 +50,3 @@ body:
       label: 실제 결과
     validations:
       required: true
-
