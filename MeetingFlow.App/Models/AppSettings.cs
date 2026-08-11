@@ -3,6 +3,11 @@ namespace MeetingFlow.App.Models;
 public sealed class AppSettings
 {
     public string ProtectedApiKey { get; set; } = string.Empty;
+    public string AiProvider { get; set; } = "gemini";
+    public string ProtectedOpenAiApiKey { get; set; } = string.Empty;
+    public string ProtectedAnthropicApiKey { get; set; } = string.Empty;
+    public string ProtectedCompatibleApiKey { get; set; } = string.Empty;
+    public string CompatibleApiEndpoint { get; set; } = "http://localhost:11434/v1";
     public string Model { get; set; } = "gemini-3.5-flash";
     public string Language { get; set; } = "ko-KR";
     public string LanguageMode { get; set; } = "fixed";
@@ -14,6 +19,8 @@ public sealed class AppSettings
     public string CrisperModel { get; set; } = "small";
     public string CrisperMode { get; set; } = "intended";
     public int CrisperChunkMinutes { get; set; } = 1;
+    public int CrisperChunkSeconds { get; set; } = 30;
+    public string VadProfile { get; set; } = "balanced";
     public bool KeepDualTranscripts { get; set; } = true;
     public bool EnableLiveDraft { get; set; } = true;
     public string LiveDraftModel { get; set; } = "base";

@@ -14,6 +14,7 @@ public sealed record LiveDraftSegment(TimeSpan Start, TimeSpan End, string Text)
 
 public sealed class PythonSttService : IDisposable
 {
+    private const int MaxLiveChunkBacklog = 12;
     private readonly string _scriptPath;
     private readonly string _pythonPath;
     private readonly string _crisperPythonPath;
@@ -203,11 +204,11 @@ public sealed class PythonSttService : IDisposable
         return transcript;
     }
 
-    public async Task<LocalTranscript> TranscribeCrisperAsync(string audioPath, string modelName, string language, string mode, int chunkMinutes, IProgress<SttProgress>? progress = null, CancellationToken token = default)
+    public async Task<LocalTranscript> TranscribeCrisperAsync(string audioPath, string modelName, string language, string mode, int chunkSeconds, IProgress<SttProgress>? progress = null, CancellationToken token = default)
     {
         if (string.IsNullOrWhiteSpace(_crisperPythonPath))
             throw new InvalidOperationException("CrisperWhisper 전용 Python 3.12 환경이 없습니다. scripts/setup-python.ps1을 실행하세요.");
-        var info = CreateStartInfo(["crisper-transcribe", "--input", audioPath, "--model", modelName, "--language", LanguageCatalog.ToWhisperCode(language), "--mode", mode, "--chunk-minutes", Math.Clamp(chunkMinutes, 1, 10).ToString()], _crisperPythonPath);
+        var info = CreateStartInfo(["crisper-transcribe", "--input", audioPath, "--model", modelName, "--language", LanguageCatalog.ToWhisperCode(language), "--mode", mode, "--chunk-seconds", Math.Clamp(chunkSeconds, 15, 120).ToString()], _crisperPythonPath);
         using var process = Process.Start(info) ?? throw new InvalidOperationException("CrisperWhisper 프로세스를 시작하지 못했습니다.");
         using var cancellation = token.Register(() => { try { if (!process.HasExited) process.Kill(true); } catch { } });
         var standardError = process.StandardError.ReadToEndAsync(token);
@@ -248,14 +249,14 @@ public sealed class PythonSttService : IDisposable
         return transcript;
     }
 
-    public Task StartLivePreviewAsync(string modelName, string language, string languageMode, string qualityProfile, CancellationToken token = default)
+    public Task StartLivePreviewAsync(string modelName, string language, string languageMode, string qualityProfile, string vadProfile, CancellationToken token = default)
     {
         if (IsLivePreviewRunning) return Task.CompletedTask;
         Interlocked.Exchange(ref _liveChunkOutstanding, 0);
         Interlocked.Exchange(ref _liveChunksSkipped, 0);
         var modelFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MeetingFlow", "Models", "faster-whisper");
         Directory.CreateDirectory(modelFolder);
-        _liveProcess = Process.Start(CreateStartInfo("live", "--model", modelName, "--language", LanguageCatalog.ToWhisperCode(language), "--language-mode", languageMode, "--model-dir", modelFolder, "--quality-profile", SttQualityPresetCatalog.Get(qualityProfile).Id))
+        _liveProcess = Process.Start(CreateStartInfo("live", "--model", modelName, "--language", LanguageCatalog.ToWhisperCode(language), "--language-mode", languageMode, "--model-dir", modelFolder, "--quality-profile", SttQualityPresetCatalog.Get(qualityProfile).Id, "--vad-profile", vadProfile))
             ?? throw new InvalidOperationException("실시간 STT 초안 프로세스를 시작하지 못했습니다.");
         _ = _liveProcess.StandardError.ReadToEndAsync(token);
         _liveReader = Task.Run(async () =>
@@ -274,13 +275,20 @@ public sealed class PythonSttService : IDisposable
                         root.GetProperty("text").GetString() ?? string.Empty));
                 else if (eventName == "live_chunk_done")
                 {
-                    Interlocked.Exchange(ref _liveChunkOutstanding, 0);
+                    var pending = Math.Max(0, Interlocked.Decrement(ref _liveChunkOutstanding));
                     var rtf = root.TryGetProperty("realtime_factor", out var factor) ? factor.GetDouble() : 0;
+                    var speech = !root.TryGetProperty("speech", out var speechValue) || speechValue.GetBoolean();
                     var skipped = Volatile.Read(ref _liveChunksSkipped);
-                    LiveDraftStatusChanged?.Invoke(this, skipped == 0 ? $"실시간 초안 · 처리 속도 {rtf:0.0}x" : $"실시간 초안 · {rtf:0.0}x · 지연 구간 {skipped}개는 종료 후 확정");
+                    var state = speech ? $"앞에서부터 변환 중 · {rtf:0.0}x" : "무음·노이즈 구간 제외";
+                    var queue = pending > 0 ? $" · 대기 {pending}개({pending * 4}초)" : " · 실시간 동기화";
+                    var recovery = skipped > 0 ? $" · 초과 {skipped}개는 종료 후 확정" : string.Empty;
+                    LiveDraftStatusChanged?.Invoke(this, state + queue + recovery);
                 }
                 else if (eventName == "error")
-                    LiveDraftStatusChanged?.Invoke(this, $"실시간 초안 중지 · {root.GetProperty("message").GetString()}");
+                {
+                    InterlockedExtensions.DecrementIfPositive(ref _liveChunkOutstanding);
+                    LiveDraftStatusChanged?.Invoke(this, $"실시간 구간 오류 · 원본은 보존됨 · {root.GetProperty("message").GetString()}");
+                }
             }
         }, token);
         return Task.CompletedTask;
@@ -289,17 +297,19 @@ public sealed class PythonSttService : IDisposable
     public async Task SubmitLiveChunkAsync(string path, double startSeconds, CancellationToken token = default)
     {
         if (!IsLivePreviewRunning || string.IsNullOrWhiteSpace(path) || _liveProcess is null) { TryDelete(path); return; }
-        if (Interlocked.CompareExchange(ref _liveChunkOutstanding, 1, 0) != 0)
+        var pending = Interlocked.Increment(ref _liveChunkOutstanding);
+        if (pending > MaxLiveChunkBacklog)
         {
+            Interlocked.Decrement(ref _liveChunkOutstanding);
             Interlocked.Increment(ref _liveChunksSkipped);
             TryDelete(path);
-            LiveDraftStatusChanged?.Invoke(this, "실시간 처리보다 음성이 빨라 초안 구간을 건너뜁니다 · 녹음 원본은 보존되고 종료 후 확정됩니다");
+            LiveDraftStatusChanged?.Invoke(this, "CPU 지연이 48초를 넘어 실시간 초안 한 구간을 미룸 · 녹음 원본은 보존되고 종료 후 자동 확정됩니다");
             return;
         }
         try { await _liveInputLock.WaitAsync(token); }
         catch
         {
-            Interlocked.Exchange(ref _liveChunkOutstanding, 0);
+            Interlocked.Decrement(ref _liveChunkOutstanding);
             TryDelete(path);
             throw;
         }
@@ -311,7 +321,7 @@ public sealed class PythonSttService : IDisposable
         }
         catch
         {
-            Interlocked.Exchange(ref _liveChunkOutstanding, 0);
+            Interlocked.Decrement(ref _liveChunkOutstanding);
             TryDelete(path);
             throw;
         }
@@ -416,5 +426,18 @@ public sealed class PythonSttService : IDisposable
         }
         _liveProcess?.Dispose();
         _liveInputLock.Dispose();
+    }
+}
+
+internal static class InterlockedExtensions
+{
+    public static void DecrementIfPositive(ref int value)
+    {
+        int current;
+        do
+        {
+            current = Volatile.Read(ref value);
+            if (current <= 0) return;
+        } while (Interlocked.CompareExchange(ref value, current - 1, current) != current);
     }
 }

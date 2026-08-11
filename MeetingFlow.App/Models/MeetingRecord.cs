@@ -2,7 +2,7 @@ namespace MeetingFlow.App.Models;
 
 public sealed class MeetingRecord
 {
-    public int DataVersion { get; set; } = 8;
+    public int DataVersion { get; set; } = 9;
     public Guid Id { get; set; } = Guid.NewGuid();
     public string Title { get; set; } = string.Empty;
     public string MeetingType { get; set; } = "일반 업무 회의";
@@ -44,6 +44,8 @@ public sealed class MeetingRecord
     public double AudioRmsDb { get; set; }
     public double AudioPeakDb { get; set; }
     public string AiOrganizationMode { get; set; } = string.Empty;
+    public string AiProvider { get; set; } = "gemini";
+    public string AiModel { get; set; } = string.Empty;
     public string AiPromptVersion { get; set; } = GeminiServicePromptVersion;
     public string ReportTemplateId { get; set; } = ReportTemplateCatalog.DefaultId;
     public string ReportTemplateName { get; set; } = "표준 회의록";

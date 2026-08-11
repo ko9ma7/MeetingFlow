@@ -148,7 +148,7 @@ def record_audio(output: str, device: int | None, live_preview: bool = False) ->
             if preview_writer is not None:
                 preview_writer.writeframesraw(data)
                 preview_bytes += len(data)
-                if preview_bytes >= rate * channels * audio.get_sample_size(pyaudio.paInt16) * 8:
+                if preview_bytes >= rate * channels * audio.get_sample_size(pyaudio.paInt16) * 4:
                     complete_preview_chunk(True)
             samples = array("h", data)
             peak = max((abs(value) for value in samples), default=0) / 32768.0
@@ -256,7 +256,11 @@ def cpu_thread_count(quality_profile: str) -> int:
     return max(2, min(profile_cap, max(2, logical_cores // 2)))
 
 
-def vad_settings(quality_profile: str) -> dict[str, object]:
+def vad_settings(quality_profile: str, vad_profile: str = "balanced") -> dict[str, object]:
+    if vad_profile == "noisy":
+        return {"threshold": 0.60, "min_silence_duration_ms": 500, "speech_pad_ms": 300}
+    if vad_profile == "sensitive":
+        return {"threshold": 0.30, "min_silence_duration_ms": 900, "speech_pad_ms": 500}
     if quality_profile == "cpu-fast":
         return {"threshold": 0.50, "min_silence_duration_ms": 500, "speech_pad_ms": 350}
     return {"threshold": 0.35, "min_silence_duration_ms": 800, "speech_pad_ms": 500}
@@ -346,7 +350,7 @@ def transcribe(audio_path: str, model: str, language: str, language_mode: str, m
     )
 
 
-def live_transcribe(model: str, language: str, language_mode: str, model_dir: str, quality_profile: str) -> None:
+def live_transcribe(model: str, language: str, language_mode: str, model_dir: str, quality_profile: str, vad_profile: str) -> None:
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
@@ -354,7 +358,7 @@ def live_transcribe(model: str, language: str, language_mode: str, model_dir: st
     emit("live_loading", message=f"실시간 초안용 {model} 모델을 준비하고 있습니다")
     threads = cpu_thread_count(quality_profile)
     engine = WhisperModel(model, device="cpu", compute_type="int8", download_root=model_dir, cpu_threads=threads, num_workers=1)
-    live_beam = 1 if quality_profile == "cpu-fast" else 3
+    live_beam = 1
     emit("live_ready", message=f"임시 자막 준비됨 · {model} · CPU {threads}스레드")
     last_clean_text = ""
     for line in sys.stdin:
@@ -373,7 +377,7 @@ def live_transcribe(model: str, language: str, language_mode: str, model_dir: st
                 language=language if language_mode == "fixed" and language != "auto" else None,
                 beam_size=live_beam,
                 vad_filter=True,
-                vad_parameters=vad_settings(quality_profile),
+                vad_parameters=vad_settings(quality_profile, vad_profile),
                 condition_on_previous_text=False,
                 temperature=0.0,
             )
@@ -391,7 +395,13 @@ def live_transcribe(model: str, language: str, language_mode: str, model_dir: st
                     emit("live_segment", start=offset, end=offset + local_end, text=clean_text)
                     last_clean_text = clean_text
             processing_seconds = time.perf_counter() - chunk_started_at
-            emit("live_chunk_done", processing_seconds=round(processing_seconds, 2), realtime_factor=round(max(local_end, 0.001) / max(processing_seconds, 0.001), 2))
+            audio_seconds = 0.0
+            try:
+                with wave.open(path, "rb") as reader:
+                    audio_seconds = reader.getnframes() / float(reader.getframerate())
+            except (OSError, wave.Error):
+                pass
+            emit("live_chunk_done", processing_seconds=round(processing_seconds, 2), audio_seconds=round(audio_seconds, 2), speech=bool(texts), realtime_factor=round(max(audio_seconds, 0.001) / max(processing_seconds, 0.001), 2))
             try:
                 Path(path).unlink(missing_ok=True)
             except OSError:
@@ -404,7 +414,7 @@ def live_transcribe(model: str, language: str, language_mode: str, model_dir: st
             emit("error", message=f"실시간 초안 구간 처리 실패: {exc}", type=type(exc).__name__)
 
 
-def crisper_transcribe(audio_path: str, model: str, language: str, mode: str, chunk_minutes: int) -> None:
+def crisper_transcribe(audio_path: str, model: str, language: str, mode: str, chunk_seconds: int) -> None:
     try:
         from crisperwhisper import CrisperWhisperModel
     except ImportError as exc:
@@ -417,7 +427,7 @@ def crisper_transcribe(audio_path: str, model: str, language: str, mode: str, ch
     started_at = time.perf_counter()
     audio = decode_audio_mono_16k(audio_path)
     duration = max(len(audio) / 16000.0, 0.001)
-    block_samples = max(1, min(chunk_minutes, 10)) * 60 * 16000
+    block_samples = max(15, min(chunk_seconds, 120)) * 16000
     overlap_samples = 5 * 16000
     starts = list(range(0, len(audio), max(block_samples - overlap_samples, 1)))
     recent_texts: list[str] = []
@@ -530,12 +540,13 @@ def main() -> int:
     live.add_argument("--language-mode", choices=["fixed", "auto", "mixed"], default="fixed")
     live.add_argument("--model-dir", required=True)
     live.add_argument("--quality-profile", choices=["cpu-fast", "cpu-accurate", "cpu-maximum"], default="cpu-accurate")
+    live.add_argument("--vad-profile", choices=["balanced", "noisy", "sensitive"], default="balanced")
     crisper = sub.add_parser("crisper-transcribe")
     crisper.add_argument("--input", required=True)
     crisper.add_argument("--model", choices=["small", "medium", "turbo", "large"], default="small")
     crisper.add_argument("--language", default="ko")
     crisper.add_argument("--mode", choices=["intended", "verbatim"], default="intended")
-    crisper.add_argument("--chunk-minutes", type=int, default=5)
+    crisper.add_argument("--chunk-seconds", type=int, default=30)
     args = parser.parse_args()
     try:
         if args.command == "health": health()
@@ -543,8 +554,8 @@ def main() -> int:
         elif args.command == "devices": list_devices()
         elif args.command == "record": record_audio(args.output, args.device, args.live_preview)
         elif args.command == "transcribe": transcribe(args.input, args.model, args.language, args.language_mode, args.model_dir, args.beam_size, args.initial_prompt, args.hotwords, args.content_profile, args.quality_profile, args.hallucination_guard, args.diarization_mode, args.speaker_count)
-        elif args.command == "live": live_transcribe(args.model, args.language, args.language_mode, args.model_dir, args.quality_profile)
-        elif args.command == "crisper-transcribe": crisper_transcribe(args.input, args.model, args.language, args.mode, args.chunk_minutes)
+        elif args.command == "live": live_transcribe(args.model, args.language, args.language_mode, args.model_dir, args.quality_profile, args.vad_profile)
+        elif args.command == "crisper-transcribe": crisper_transcribe(args.input, args.model, args.language, args.mode, args.chunk_seconds)
         return 0
     except Exception as exc:
         emit("error", message=str(exc), type=type(exc).__name__)

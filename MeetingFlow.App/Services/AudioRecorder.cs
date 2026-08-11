@@ -7,7 +7,7 @@ public sealed record AudioPreviewChunk(string Path, double StartSeconds, double 
 
 public sealed class AudioRecorder : IDisposable
 {
-    private const int PreviewChunkSeconds = 8;
+    private const int PreviewChunkSeconds = 4;
     private IWaveIn? _capture;
     private WaveFileWriter? _writer;
     private WaveFileWriter? _previewWriter;

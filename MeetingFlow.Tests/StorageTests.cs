@@ -13,14 +13,17 @@ public sealed class StorageTests : IDisposable
     {
         var service = new SettingsService(_root);
         var protectedKey = SettingsService.ProtectApiKey("test-secret-key");
-        service.Save(new AppSettings { ProtectedApiKey = protectedKey, Model = "gemini-test", Temperature = 0.4, ShowTimelineEditor = false, AutoRetryPendingAi = false, GeminiConnectionTimeoutSeconds = 15, RequireTranscriptReviewBeforeAi = true, EnableLiveDraft = true, LiveDraftModel = "base", SttQualityProfile = "cpu-accurate", SttEngine = "hybrid-compare", CrisperModel = "small", CrisperMode = "intended", CrisperChunkMinutes = 2, SpeakerDiarizationMode = "fixed", SpeakerCount = 3 });
+        service.Save(new AppSettings { ProtectedApiKey = protectedKey, AiProvider = "openai", ProtectedOpenAiApiKey = SettingsService.ProtectApiKey("openai-secret"), CompatibleApiEndpoint = "http://localhost:11434/v1", Model = "gpt-test", Temperature = 0.4, ShowTimelineEditor = false, AutoRetryPendingAi = false, GeminiConnectionTimeoutSeconds = 15, RequireTranscriptReviewBeforeAi = true, EnableLiveDraft = true, LiveDraftModel = "base", SttQualityProfile = "cpu-accurate", SttEngine = "hybrid-compare", CrisperModel = "small", CrisperMode = "intended", CrisperChunkMinutes = 2, CrisperChunkSeconds = 30, VadProfile = "noisy", SpeakerDiarizationMode = "fixed", SpeakerCount = 3 });
 
         var loaded = service.Load();
 
-        Assert.Equal("gemini-test", loaded.Model);
+        Assert.Equal("gpt-test", loaded.Model);
         Assert.Equal(0.4, loaded.Temperature);
         Assert.NotEqual("test-secret-key", loaded.ProtectedApiKey);
         Assert.Equal("test-secret-key", SettingsService.UnprotectApiKey(loaded.ProtectedApiKey));
+        Assert.Equal("openai", loaded.AiProvider);
+        Assert.Equal("openai-secret", GeminiService.GetApiKey(loaded));
+        Assert.Equal("http://localhost:11434/v1", loaded.CompatibleApiEndpoint);
         Assert.False(loaded.ShowTimelineEditor);
         Assert.False(loaded.AutoRetryPendingAi);
         Assert.Equal(15, loaded.GeminiConnectionTimeoutSeconds);
@@ -31,6 +34,8 @@ public sealed class StorageTests : IDisposable
         Assert.Equal("small", loaded.CrisperModel);
         Assert.Equal("intended", loaded.CrisperMode);
         Assert.Equal(2, loaded.CrisperChunkMinutes);
+        Assert.Equal(30, loaded.CrisperChunkSeconds);
+        Assert.Equal("noisy", loaded.VadProfile);
         Assert.Equal("cpu-accurate", loaded.SttQualityProfile);
         Assert.Equal("fixed", loaded.SpeakerDiarizationMode);
         Assert.Equal(3, loaded.SpeakerCount);

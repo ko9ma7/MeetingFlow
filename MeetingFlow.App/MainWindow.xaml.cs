@@ -39,6 +39,7 @@ public partial class MainWindow : Window
     private DateTime _lastLiveCheckpointSavedAt;
     private DateTime _lastSttCheckpointSavedAt;
     private string _lastLiveSegmentText = string.Empty;
+    private bool _suppressLiveDraftSync;
     private readonly StringBuilder _sttDiagnostics = new();
     private string _lastSttLogMessage = string.Empty;
 
@@ -73,6 +74,11 @@ public partial class MainWindow : Window
         _settings.LiveDraftModel = qualityPreset.LiveModel;
         _settings.SttBeamSize = qualityPreset.BeamSize;
         ApiKeyBox.Password = SettingsService.UnprotectApiKey(_settings.ProtectedApiKey);
+        OpenAiApiKeyBox.Password = SettingsService.UnprotectApiKey(_settings.ProtectedOpenAiApiKey);
+        AnthropicApiKeyBox.Password = SettingsService.UnprotectApiKey(_settings.ProtectedAnthropicApiKey);
+        CompatibleApiKeyBox.Password = SettingsService.UnprotectApiKey(_settings.ProtectedCompatibleApiKey);
+        CompatibleEndpointBox.Text = _settings.CompatibleApiEndpoint;
+        AiProviderBox.SelectedIndex = _settings.AiProvider switch { "openai" => 1, "anthropic" => 2, "compatible" => 3, _ => 0 };
         ModelBox.Text = _settings.Model;
         TemperatureSlider.Value = _settings.Temperature;
         AutoSummaryBox.IsChecked = !_settings.RequireTranscriptReviewBeforeAi && _settings.AutoSummarize;
@@ -110,7 +116,8 @@ public partial class MainWindow : Window
         LiveDraftModelBox.SelectedIndex = _settings.LiveDraftModel switch { "tiny" => 0, "small" => 2, "medium" => 3, _ => 1 };
         CrisperModelBox.SelectedIndex = _settings.CrisperModel switch { "medium" => 1, "turbo" => 2, "large" => 3, _ => 0 };
         CrisperModeBox.SelectedIndex = _settings.CrisperMode == "verbatim" ? 1 : 0;
-        CrisperChunkMinutesBox.SelectedIndex = _settings.CrisperChunkMinutes switch { 2 => 1, 5 => 2, 10 => 3, _ => 0 };
+        CrisperChunkSecondsBox.SelectedIndex = _settings.CrisperChunkSeconds switch { 15 => 0, 60 => 2, 120 => 3, _ => 1 };
+        VadProfileBox.SelectedIndex = _settings.VadProfile switch { "noisy" => 1, "sensitive" => 2, _ => 0 };
         SpeakerModeBox.SelectedIndex = _settings.SpeakerDiarizationMode switch { "auto" => 1, "fixed" => 2, _ => 0 };
         SpeakerCountBox.Text = _settings.SpeakerCount.ToString();
         HomeSpeakerModeBox.SelectedIndex = SpeakerModeBox.SelectedIndex;
@@ -133,7 +140,7 @@ public partial class MainWindow : Window
 
     private void RefreshApiStatus()
     {
-        var hasKey = !string.IsNullOrWhiteSpace(SettingsService.UnprotectApiKey(_settings.ProtectedApiKey));
+        var hasKey = !string.IsNullOrWhiteSpace(GeminiService.GetApiKey(_settings)) || _settings.AiProvider == "compatible";
         var pendingCount = _repository.LoadAll().Count(x => x.AiStatus == "대기");
         ApiStatusDot.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#35A46F"));
         var engine = _pythonReady ? "PyAudio 준비" : "C# 로컬 STT";
@@ -306,7 +313,7 @@ public partial class MainWindow : Window
         MeetingTitleBox.Text = "새 회의";
         TimerText.Text = "00:00:00";
         TranscriptBox.Text = "녹음하거나 오디오 파일을 가져오면 로컬 STT 원문이 여기에 표시됩니다.";
-        SummaryBox.Text = "Gemini 정리를 사용하면 회의 요약, 결정사항과 실행 항목이 여기에 표시됩니다.";
+        SummaryBox.Text = "선택한 AI로 정리하면 회의 요약, 결정사항과 실행 항목이 여기에 표시됩니다.";
         ComparisonSummaryText.Text = "이중 검증 엔진을 선택하면 시간 구간별 일치도를 표시합니다.";
         SecondaryTranscriptBox.Text = "보조 전사 결과가 여기에 별도로 보존됩니다.";
         RecordingConsentBox.IsChecked = false;
@@ -347,12 +354,15 @@ public partial class MainWindow : Window
             _preparedAudioIsImported = false;
             var loopback = GetComboTag(AudioSourceBox, "microphone") == "loopback";
             var livePreview = _settings.EnableLiveDraft && _pythonReady && _settings.SttEngine != "csharp-whispernet";
+            _activeRecord = null;
             _liveDraftText.Clear();
             _lastLiveSegmentText = string.Empty;
+            _suppressLiveDraftSync = true;
             LiveDraftBox.Clear();
+            _suppressLiveDraftSync = false;
             LiveDraftStatusText.Text = livePreview ? "실시간 저장 전사 엔진 시작 중" : "실시간 전사 꺼짐 · 오디오만 안전하게 저장";
             if (livePreview)
-                await _pythonStt.StartLivePreviewAsync(_settings.LiveDraftModel, _settings.Language, _settings.LanguageMode, _settings.SttQualityProfile);
+                await _pythonStt.StartLivePreviewAsync(_settings.LiveDraftModel, _settings.Language, _settings.LanguageMode, _settings.SttQualityProfile, _settings.VadProfile);
             if (loopback)
                 _recorder.StartLoopback(_currentAudioPath, livePreview);
             else if (_pythonReady && _pythonDevices.Count > DeviceBox.SelectedIndex)
@@ -563,7 +573,7 @@ public partial class MainWindow : Window
             else if (selectedEngine == "python-crisperwhisper")
             {
                 if (!_crisperReady) throw new InvalidOperationException("CrisperWhisper 전용 환경이 준비되지 않았습니다. 설정 화면의 설치 상태를 확인하세요.");
-                localTranscript = await _pythonStt.TranscribeCrisperAsync(audioPath, _settings.CrisperModel, _settings.Language, _settings.CrisperMode, _settings.CrisperChunkMinutes, progress, token);
+                localTranscript = await _pythonStt.TranscribeCrisperAsync(audioPath, _settings.CrisperModel, _settings.Language, _settings.CrisperMode, _settings.CrisperChunkSeconds, progress, token);
                 engineLabel = "CrisperWhisper 2.0 / Transformers CPU";
                 modelLabel = _settings.CrisperModel;
             }
@@ -577,7 +587,7 @@ public partial class MainWindow : Window
                 {
                     try
                     {
-                        var crisperTranscript = await _pythonStt.TranscribeCrisperAsync(audioPath, _settings.CrisperModel, _settings.Language, _settings.CrisperMode, _settings.CrisperChunkMinutes, progress, token);
+                        var crisperTranscript = await _pythonStt.TranscribeCrisperAsync(audioPath, _settings.CrisperModel, _settings.Language, _settings.CrisperMode, _settings.CrisperChunkSeconds, progress, token);
                         if (crisperTranscript.Segments.Count > 0)
                         {
                             localTranscript = crisperTranscript;
@@ -651,7 +661,7 @@ public partial class MainWindow : Window
                 DetectedLanguage = localTranscript.DetectedLanguage, DetectedLanguageProbability = localTranscript.LanguageProbability,
                 LanguageConstraintWarning = localTranscript.LanguageConstraintWarning, AudioQualityWarning = localTranscript.AudioQualityWarning,
                 AudioRmsDb = localTranscript.AudioRmsDb, AudioPeakDb = localTranscript.AudioPeakDb,
-                AiOrganizationMode = aiMode, AiSourceRange = rangeLabel,
+                AiOrganizationMode = aiMode, AiProvider = _settings.AiProvider, AiModel = _settings.Model, AiSourceRange = rangeLabel,
                 AiPromptVersion = GeminiService.PromptVersion,
                 AiRangeStartMinute = (int)(startSeconds / 60), AiRangeEndMinute = (int)Math.Ceiling(endSeconds / 60),
                 AiRangeStartSeconds = startSeconds, AiRangeEndSeconds = endSeconds,
@@ -672,7 +682,7 @@ public partial class MainWindow : Window
             {
                 record.TranscriptReviewed = true;
                 record.TranscriptReviewedAt = DateTime.Now;
-                ProgressText.Text = $"3/3  Gemini가 {rangeLabel}을 '{reportTemplate.Name}' 형식으로 정리하고 있습니다…";
+                ProgressText.Text = $"3/3  {GeminiService.GetProviderName(_settings.AiProvider)}가 {rangeLabel}을 '{reportTemplate.Name}' 형식으로 정리하고 있습니다…";
                 await GenerateAiReportAsync(record, reportTemplate, token);
                 SummaryBox.Text = record.AiNotesText;
                 ResultTabs.SelectedIndex = 1;
@@ -688,7 +698,7 @@ public partial class MainWindow : Window
             ReloadRecords();
             FooterStatus.Text = $"저장 완료 · {record.DisplayDate}";
             ProgressText.Text = record.AiStatus == "검토 대기"
-                ? "정확도 전사를 저장했습니다. 원문 검토가 끝날 때까지 Gemini에는 아무 내용도 보내지 않습니다."
+                ? "정확도 전사를 저장했습니다. 원문 검토가 끝날 때까지 외부 AI에는 아무 내용도 보내지 않습니다."
                 : record.AiStatus == "대기" ? "STT 원문은 저장했고 AI 보고서는 연결 복구 후 다시 처리합니다." : "로컬 원문과 AI 보고서를 분리해 저장했습니다.";
             await Task.Delay(1200, token);
         }
@@ -717,8 +727,8 @@ public partial class MainWindow : Window
         record.AiLastError = string.Empty;
         try
         {
-            var apiKey = SettingsService.UnprotectApiKey(_settings.ProtectedApiKey);
-            if (string.IsNullOrWhiteSpace(apiKey)) throw new InvalidOperationException("Gemini API 키가 설정되지 않았습니다.");
+            var apiKey = GeminiService.GetApiKey(_settings);
+            if (string.IsNullOrWhiteSpace(apiKey) && _settings.AiProvider != "compatible") throw new InvalidOperationException($"{GeminiService.GetProviderName(_settings.AiProvider)} API 키가 설정되지 않았습니다.");
             var fullRange = record.AiRangeStartSeconds <= 0.5 &&
                             (record.AiRangeEndSeconds <= 0 || record.Duration <= TimeSpan.Zero || record.AiRangeEndSeconds >= record.Duration.TotalSeconds - 1.5);
             var selectedSegments = record.AiRangeEndSeconds > 0
@@ -731,6 +741,8 @@ public partial class MainWindow : Window
                     : string.Empty;
             if (string.IsNullOrWhiteSpace(sourceText)) throw new InvalidOperationException("지정한 시간 범위에 전사 내용이 없습니다.");
             _settings.AiOrganizationMode = record.AiOrganizationMode;
+            record.AiProvider = _settings.AiProvider;
+            record.AiModel = _settings.Model;
             var result = await _gemini.OrganizeAsync(sourceText, record.MeetingType, template, _settings, record.ContentProfileId, token);
             record.Summary = result.Summary;
             record.AiNotesText = result.ReportMarkdown;
@@ -751,7 +763,7 @@ public partial class MainWindow : Window
             record.AiStatus = "대기";
             record.ProcessingStatus = "AI 정리 대기";
             record.AiLastError = ex.Message;
-            record.AiNotesText = $"AI 보고서 정리 대기\n\nSTT 원문은 안전하게 저장되었습니다. Gemini 연결이 복구되면 설정의 'AI 대기 작업 다시 처리' 또는 기록의 재정리 버튼을 사용하세요.\n\n마지막 오류: {ex.Message}";
+            record.AiNotesText = $"AI 보고서 정리 대기\n\nSTT 원문은 안전하게 저장되었습니다. 선택한 AI 연결이 복구되면 설정의 'AI 대기 작업 다시 처리' 또는 기록의 재정리 버튼을 사용하세요.\n\n마지막 오류: {ex.Message}";
         }
         finally
         {
@@ -958,13 +970,27 @@ public partial class MainWindow : Window
         var cleanText = TranscriptTextSanitizer.SanitizeLiveSegment(segment.Text);
         if (string.IsNullOrWhiteSpace(cleanText) || string.Equals(cleanText, _lastLiveSegmentText, StringComparison.OrdinalIgnoreCase)) return;
         _lastLiveSegmentText = cleanText;
+        var currentText = LiveDraftBox.Text.TrimEnd();
+        _liveDraftText.Clear();
+        _liveDraftText.Append(currentText);
         var line = $"[{segment.Start.ToString(@"hh\:mm\:ss")}]  {cleanText}";
         if (_liveDraftText.Length > 0) _liveDraftText.AppendLine();
         _liveDraftText.Append(line);
+        _suppressLiveDraftSync = true;
         LiveDraftBox.Text = _liveDraftText.ToString();
+        _suppressLiveDraftSync = false;
         LiveDraftBox.ScrollToEnd();
-        LiveDraftStatusText.Text = "실시간 로컬 저장 중 · 종료하면 자동으로 정밀 보정";
+        LiveDraftStatusText.Text = "앞에서부터 표시·편집·자동 저장 · 종료 후 정밀 보정";
         SaveLiveCheckpoint(DateTime.Now - _recordingStarted, "녹음 중 · 실시간 저장", false);
+    }
+
+    private void LiveDraftBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_suppressLiveDraftSync || _activeRecord is null) return;
+        _liveDraftText.Clear();
+        _liveDraftText.Append(LiveDraftBox.Text);
+        LiveDraftStatusText.Text = "수정한 초안 자동 저장 중 · 새 전사는 아래에 이어집니다";
+        SaveLiveCheckpoint(DateTime.Now - _recordingStarted, "녹음 중 · 사용자 수정본 저장", false);
     }
 
     private MeetingRecord CreateRecordingCheckpoint(string audioPath, DateTime startedAt)
@@ -1047,7 +1073,7 @@ public partial class MainWindow : Window
             rangeEnd = ParseMinute(AiRangeEndBox.Text, "기본 종료 위치");
             if (rangeEnd > 0 && rangeEnd <= rangeStart) throw new ArgumentException("기본 종료 위치는 시작 위치보다 커야 합니다.");
             if (!int.TryParse(SttBeamSizeBox.Text, out beamSize) || beamSize is < 1 or > 12) throw new ArgumentException("Beam Search 정확도는 1~12 사이로 입력하세요.");
-            if (!int.TryParse(GeminiTimeoutBox.Text, out connectionTimeout) || connectionTimeout is < 5 or > 60) throw new ArgumentException("Gemini 연결 제한시간은 5~60초 사이로 입력하세요.");
+            if (!int.TryParse(GeminiTimeoutBox.Text, out connectionTimeout) || connectionTimeout is < 5 or > 60) throw new ArgumentException("AI 연결 제한시간은 5~60초 사이로 입력하세요.");
             if (!int.TryParse(SpeakerCountBox.Text, out speakerCount) || speakerCount is < 1 or > 12) throw new ArgumentException("예상 화자 수는 1~12명 사이로 입력하세요.");
         }
         catch (ArgumentException ex)
@@ -1056,10 +1082,25 @@ public partial class MainWindow : Window
             return;
         }
         var apiKey = ApiKeyBox.Password.Trim();
+        var openAiApiKey = OpenAiApiKeyBox.Password.Trim();
+        var anthropicApiKey = AnthropicApiKeyBox.Password.Trim();
+        var compatibleApiKey = CompatibleApiKeyBox.Password.Trim();
+        var aiProvider = GetComboTag(AiProviderBox, "gemini");
+        var compatibleEndpoint = CompatibleEndpointBox.Text.Trim();
+        if (aiProvider == "compatible" && (!Uri.TryCreate(compatibleEndpoint, UriKind.Absolute, out var endpointUri) || endpointUri.Scheme is not ("http" or "https")))
+        {
+            ShowError("호환 서버 주소를 확인하세요", "http:// 또는 https://로 시작하는 OpenAI 호환 API 주소를 입력하세요.");
+            return;
+        }
         var huggingFaceToken = HuggingFaceTokenBox.Password.Trim();
         _settings = new AppSettings
         {
             ProtectedApiKey = string.IsNullOrWhiteSpace(apiKey) ? _settings.ProtectedApiKey : SettingsService.ProtectApiKey(apiKey),
+            AiProvider = aiProvider,
+            ProtectedOpenAiApiKey = string.IsNullOrWhiteSpace(openAiApiKey) ? _settings.ProtectedOpenAiApiKey : SettingsService.ProtectApiKey(openAiApiKey),
+            ProtectedAnthropicApiKey = string.IsNullOrWhiteSpace(anthropicApiKey) ? _settings.ProtectedAnthropicApiKey : SettingsService.ProtectApiKey(anthropicApiKey),
+            ProtectedCompatibleApiKey = string.IsNullOrWhiteSpace(compatibleApiKey) ? _settings.ProtectedCompatibleApiKey : SettingsService.ProtectApiKey(compatibleApiKey),
+            CompatibleApiEndpoint = string.IsNullOrWhiteSpace(compatibleEndpoint) ? "http://localhost:11434/v1" : compatibleEndpoint,
             Model = string.IsNullOrWhiteSpace(ModelBox.Text) ? "gemini-3.5-flash" : ModelBox.Text.Trim(),
             Language = (LanguageBox.SelectedItem as LanguageOption)?.Code ?? "ko-KR",
             LanguageMode = GetComboTag(LanguageModeBox, "fixed"),
@@ -1070,7 +1111,9 @@ public partial class MainWindow : Window
             SttEngine = GetComboTag(SttEngineBox, "python-faster-whisper"),
             CrisperModel = GetComboTag(CrisperModelBox, "small"),
             CrisperMode = GetComboTag(CrisperModeBox, "intended"),
-            CrisperChunkMinutes = int.Parse(GetComboTag(CrisperChunkMinutesBox, "1")),
+            CrisperChunkMinutes = _settings.CrisperChunkMinutes,
+            CrisperChunkSeconds = int.Parse(GetComboTag(CrisperChunkSecondsBox, "30")),
+            VadProfile = GetComboTag(VadProfileBox, "balanced"),
             KeepDualTranscripts = true,
             EnableLiveDraft = EnableLiveDraftBox.IsChecked == true,
             LiveDraftModel = GetComboTag(LiveDraftModelBox, "base"),
@@ -1113,20 +1156,21 @@ public partial class MainWindow : Window
     private async void TestConnectionButton_Click(object sender, RoutedEventArgs e)
     {
         SaveSettingsButton_Click(sender, e);
-        var apiKey = SettingsService.UnprotectApiKey(_settings.ProtectedApiKey);
-        if (string.IsNullOrWhiteSpace(apiKey)) { ShowError("API 키가 비어 있습니다", "Google AI Studio에서 발급받은 Gemini API 키를 입력하세요."); return; }
+        var apiKey = GeminiService.GetApiKey(_settings);
+        var providerName = GeminiService.GetProviderName(_settings.AiProvider);
+        if (string.IsNullOrWhiteSpace(apiKey) && _settings.AiProvider != "compatible") { ShowError("API 키가 비어 있습니다", $"{providerName} API 키를 입력하세요."); return; }
         SettingsMessage.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#697386"));
         SettingsMessage.Text = "연결을 확인하고 있습니다…";
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Clamp(_settings.GeminiConnectionTimeoutSeconds, 5, 60)));
-            var models = await _gemini.GetAvailableModelsAsync(apiKey, timeout.Token);
-            if (models.Count == 0) throw new InvalidOperationException("이 API 키에서 generateContent를 지원하는 Gemini 모델을 찾지 못했습니다.");
+            var models = await _gemini.GetAvailableModelsAsync(_settings, apiKey, timeout.Token);
+            if (models.Count == 0) throw new InvalidOperationException($"{providerName}에서 사용할 수 있는 모델을 찾지 못했습니다.");
             ModelBox.Items.Clear();
             foreach (var model in models) ModelBox.Items.Add(model);
             if (!models.Contains(_settings.Model, StringComparer.OrdinalIgnoreCase))
             {
-                if (!_settings.AutoSelectAvailableGeminiModel)
+                if (!_settings.AutoSelectAvailableGeminiModel || _settings.AiProvider != "gemini")
                     throw new InvalidOperationException($"선택한 모델 '{_settings.Model}'을 이 API 키에서 사용할 수 없습니다. 사용 가능한 모델을 선택하세요.");
                 _settings.Model = models.FirstOrDefault(x => x.Equals("gemini-3.5-flash", StringComparison.OrdinalIgnoreCase))
                     ?? models.FirstOrDefault(x => x.Equals("gemini-2.5-flash", StringComparison.OrdinalIgnoreCase))
@@ -1138,7 +1182,7 @@ public partial class MainWindow : Window
             {
                 await _gemini.TestAsync(_settings, apiKey);
             }
-            catch (InvalidOperationException ex) when (_settings.AutoSelectAvailableGeminiModel
+            catch (InvalidOperationException ex) when (_settings.AiProvider == "gemini" && _settings.AutoSelectAvailableGeminiModel
                 && (ex.Message.Contains("503", StringComparison.OrdinalIgnoreCase)
                     || ex.Message.Contains("404", StringComparison.OrdinalIgnoreCase)
                     || ex.Message.Contains("high demand", StringComparison.OrdinalIgnoreCase)
@@ -1180,7 +1224,7 @@ public partial class MainWindow : Window
                 SettingsMessage.Text = $"연결 성공 · {_settings.Model} · AI 대기 작업 확인 중…";
                 completed = await RetryPendingAiCoreAsync(CancellationToken.None);
             }
-            SettingsMessage.Text = !_settings.AutoRetryPendingAi ? $"연결 성공 · {_settings.Model}" : completed == 0 ? "연결에 성공했습니다. AI 대기 작업이 없습니다." : $"연결 성공 · 대기 작업 {completed}건을 정리했습니다.";
+            SettingsMessage.Text = !_settings.AutoRetryPendingAi ? $"{providerName} 연결 성공 · {_settings.Model}" : completed == 0 ? $"{providerName} 연결에 성공했습니다. AI 대기 작업이 없습니다." : $"{providerName} 연결 성공 · 대기 작업 {completed}건을 정리했습니다.";
             ApiStatusText.Text = "연결됨";
         }
         catch (Exception ex)
@@ -1207,6 +1251,20 @@ public partial class MainWindow : Window
     }
 
     private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) => ReloadRecords(SearchBox.Text.Trim());
+
+    private void AiProviderBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!IsLoaded) return;
+        var provider = GetComboTag(AiProviderBox, "gemini");
+        ModelBox.Text = provider switch
+        {
+            "openai" => "gpt-5-mini",
+            "anthropic" => "claude-sonnet-4-5",
+            "compatible" => "local-model",
+            _ => "gemini-3.5-flash"
+        };
+        SettingsMessage.Text = $"{GeminiService.GetProviderName(provider)}를 선택했습니다. 모델 ID와 해당 API 키를 확인하세요.";
+    }
 
     private void RecordsList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {

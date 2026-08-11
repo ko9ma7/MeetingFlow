@@ -1,5 +1,7 @@
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using MeetingFlow.App.Models;
 
@@ -11,8 +13,8 @@ public sealed class GeminiService
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromMinutes(8) };
     public async Task<AiReportResult> OrganizeAsync(string transcript, string meetingType, ReportTemplate template, AppSettings settings, string contentProfileId = TranscriptionProfileCatalog.DefaultId, CancellationToken token = default)
     {
-        var apiKey = SettingsService.UnprotectApiKey(settings.ProtectedApiKey);
-        if (string.IsNullOrWhiteSpace(apiKey)) throw new InvalidOperationException("AI 정리를 사용하려면 Gemini API 키가 필요합니다.");
+        var apiKey = GetApiKey(settings);
+        if (string.IsNullOrWhiteSpace(apiKey) && settings.AiProvider != "compatible") throw new InvalidOperationException($"AI 정리를 사용하려면 {GetProviderName(settings.AiProvider)} API 키가 필요합니다.");
         var detailGuide = settings.AiOrganizationMode switch
         {
             "간단 정리" => "핵심 내용과 결정사항 위주로 짧게",
@@ -50,7 +52,9 @@ public sealed class GeminiService
             summary에는 원문에 실제로 존재하는 정보만 넣고, 해당 항목이 없으면 빈 배열을 사용하세요.
             """;
         var source = $"<source_transcript>\n{transcript}\n</source_transcript>";
-        var text = await GenerateAsync(settings.Model, apiKey, settings.Temperature, [new { text = prompt }, new { text = source }], token, true);
+        var text = settings.AiProvider == "gemini"
+            ? await GenerateAsync(settings.Model, apiKey, settings.Temperature, [new { text = prompt }, new { text = source }], token, true)
+            : await GenerateProviderAsync(settings, apiKey, prompt, source, true, token);
         return AiReportParser.Parse(text);
     }
 
@@ -60,16 +64,38 @@ public sealed class GeminiService
         timeout.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(settings.GeminiConnectionTimeoutSeconds, 5, 60)));
         try
         {
-            var response = await GenerateAsync(settings.Model, apiKey, 0, [new { text = "'연결 성공'이라고만 답하세요." }], timeout.Token);
-            if (string.IsNullOrWhiteSpace(response)) throw new InvalidOperationException("Gemini가 빈 응답을 반환했습니다.");
+            var response = settings.AiProvider == "gemini"
+                ? await GenerateAsync(settings.Model, apiKey, 0, [new { text = "'연결 성공'이라고만 답하세요." }], timeout.Token)
+                : await GenerateProviderAsync(settings, apiKey, "간단한 연결 확인입니다.", "'연결 성공'이라고만 답하세요.", false, timeout.Token);
+            if (string.IsNullOrWhiteSpace(response)) throw new InvalidOperationException($"{GetProviderName(settings.AiProvider)}가 빈 응답을 반환했습니다.");
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {
-            throw new TimeoutException($"Gemini가 {settings.GeminiConnectionTimeoutSeconds}초 안에 응답하지 않았습니다. 인터넷·방화벽·VPN 상태를 확인하세요.");
+            throw new TimeoutException($"{GetProviderName(settings.AiProvider)}가 {settings.GeminiConnectionTimeoutSeconds}초 안에 응답하지 않았습니다. 인터넷·방화벽·VPN 상태를 확인하세요.");
         }
     }
 
-    public async Task<IReadOnlyList<string>> GetAvailableModelsAsync(string apiKey, CancellationToken token = default)
+    public async Task<IReadOnlyList<string>> GetAvailableModelsAsync(AppSettings settings, string apiKey, CancellationToken token = default)
+    {
+        if (settings.AiProvider == "gemini") return await GetGeminiModelsAsync(apiKey, token);
+        var endpoint = settings.AiProvider switch
+        {
+            "openai" => "https://api.openai.com/v1/models",
+            "anthropic" => "https://api.anthropic.com/v1/models",
+            _ => $"{settings.CompatibleApiEndpoint.TrimEnd('/')}/models"
+        };
+        using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
+        AddProviderHeaders(request, settings.AiProvider, apiKey);
+        using var response = await _http.SendAsync(request, token);
+        var json = await response.Content.ReadAsStringAsync(token);
+        if (!response.IsSuccessStatusCode) throw CreateProviderException(settings.AiProvider, response.StatusCode, json);
+        using var document = JsonDocument.Parse(json);
+        if (!document.RootElement.TryGetProperty("data", out var data)) return [];
+        return data.EnumerateArray().Select(x => x.TryGetProperty("id", out var id) ? id.GetString() ?? string.Empty : string.Empty)
+            .Where(x => !string.IsNullOrWhiteSpace(x)).OrderBy(x => x).ToList();
+    }
+
+    private async Task<IReadOnlyList<string>> GetGeminiModelsAsync(string apiKey, CancellationToken token)
     {
         var url = $"https://generativelanguage.googleapis.com/v1beta/models?key={Uri.EscapeDataString(apiKey)}&pageSize=1000";
         using var response = await _http.GetAsync(url, token);
@@ -85,6 +111,133 @@ public sealed class GeminiService
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(name => name)
             .ToList();
+    }
+
+    public static string GetApiKey(AppSettings settings) => SettingsService.UnprotectApiKey(settings.AiProvider switch
+    {
+        "openai" => settings.ProtectedOpenAiApiKey,
+        "anthropic" => settings.ProtectedAnthropicApiKey,
+        "compatible" => settings.ProtectedCompatibleApiKey,
+        _ => settings.ProtectedApiKey
+    });
+
+    public static string GetProviderName(string provider) => provider switch
+    {
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic",
+        "compatible" => "OpenAI 호환 서버",
+        _ => "Gemini"
+    };
+
+    private async Task<string> GenerateProviderAsync(AppSettings settings, string apiKey, string systemPrompt, string userText, bool jsonMode, CancellationToken token)
+    {
+        var endpoint = settings.AiProvider switch
+        {
+            "openai" => "https://api.openai.com/v1/responses",
+            "anthropic" => "https://api.anthropic.com/v1/messages",
+            _ => $"{settings.CompatibleApiEndpoint.TrimEnd('/')}/chat/completions"
+        };
+        object body = settings.AiProvider switch
+        {
+            "openai" => BuildOpenAiBody(settings.Model, systemPrompt, userText, jsonMode),
+            "anthropic" => new
+            {
+                model = settings.Model,
+                max_tokens = 8192,
+                system = systemPrompt + (jsonMode ? "\n반드시 유효한 JSON 객체 하나만 출력하세요." : string.Empty),
+                messages = new[] { new { role = "user", content = userText } }
+            },
+            _ => BuildCompatibleBody(settings.Model, settings.Temperature, systemPrompt, userText, jsonMode)
+        };
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json")
+        };
+        AddProviderHeaders(request, settings.AiProvider, apiKey);
+        using var response = await _http.SendAsync(request, token);
+        var json = await response.Content.ReadAsStringAsync(token);
+        if (!response.IsSuccessStatusCode) throw CreateProviderException(settings.AiProvider, response.StatusCode, json);
+        using var document = JsonDocument.Parse(json);
+        return ExtractProviderText(settings.AiProvider, document.RootElement);
+    }
+
+    private static void AddProviderHeaders(HttpRequestMessage request, string provider, string apiKey)
+    {
+        if (provider == "anthropic")
+        {
+            request.Headers.TryAddWithoutValidation("x-api-key", apiKey);
+            request.Headers.TryAddWithoutValidation("anthropic-version", "2023-06-01");
+        }
+        else if (!string.IsNullOrWhiteSpace(apiKey)) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+    }
+
+    private static object BuildOpenAiBody(string model, string systemPrompt, string userText, bool jsonMode)
+    {
+        var input = new object[] { new { role = "developer", content = systemPrompt }, new { role = "user", content = userText } };
+        return jsonMode
+            ? new { model, store = false, input, text = new { format = new { type = "json_schema", name = "meeting_report", strict = true, schema = ReportSchema() } } }
+            : new { model, store = false, input };
+    }
+
+    private static object BuildCompatibleBody(string model, double temperature, string systemPrompt, string userText, bool jsonMode)
+    {
+        var messages = new[] { new { role = "system", content = systemPrompt }, new { role = "user", content = userText } };
+        return jsonMode
+            ? new { model, messages, temperature, response_format = new { type = "json_object" } }
+            : new { model, messages, temperature };
+    }
+
+    private static string ExtractProviderText(string provider, JsonElement root)
+    {
+        if (provider == "openai" && root.TryGetProperty("output", out var output))
+        {
+            foreach (var item in output.EnumerateArray())
+                if (item.TryGetProperty("content", out var content))
+                    foreach (var part in content.EnumerateArray())
+                        if (part.TryGetProperty("text", out var text) && !string.IsNullOrWhiteSpace(text.GetString())) return text.GetString()!;
+        }
+        if (provider == "anthropic" && root.TryGetProperty("content", out var anthropicContent))
+            return string.Join("\n", anthropicContent.EnumerateArray().Where(x => x.TryGetProperty("text", out _)).Select(x => x.GetProperty("text").GetString()));
+        if (root.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0)
+            return choices[0].GetProperty("message").GetProperty("content").GetString() ?? string.Empty;
+        throw new InvalidOperationException($"{GetProviderName(provider)} 응답에서 텍스트를 찾지 못했습니다.");
+    }
+
+    private static object ReportSchema() => new
+    {
+        type = "object",
+        additionalProperties = false,
+        required = new[] { "reportMarkdown", "summary" },
+        properties = new
+        {
+            reportMarkdown = new { type = "string" },
+            summary = new
+            {
+                type = "object",
+                additionalProperties = false,
+                required = new[] { "overview", "topics", "decisions", "actionItems", "openQuestions" },
+                properties = new
+                {
+                    overview = new { type = "string" },
+                    topics = new { type = "array", items = new { type = "string" } },
+                    decisions = new { type = "array", items = new { type = "string" } },
+                    actionItems = new { type = "array", items = new { type = "object", additionalProperties = false, required = new[] { "task", "owner", "dueDate" }, properties = new { task = new { type = "string" }, owner = new { type = "string" }, dueDate = new { type = "string" } } } },
+                    openQuestions = new { type = "array", items = new { type = "string" } }
+                }
+            }
+        }
+    };
+
+    private static Exception CreateProviderException(string provider, System.Net.HttpStatusCode statusCode, string json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            var error = document.RootElement.TryGetProperty("error", out var value) ? value : document.RootElement;
+            var message = error.ValueKind == JsonValueKind.Object && error.TryGetProperty("message", out var property) ? property.GetString() : error.ToString();
+            return new InvalidOperationException($"{GetProviderName(provider)} 요청 실패 ({(int)statusCode}): {message}");
+        }
+        catch (JsonException) { return new InvalidOperationException($"{GetProviderName(provider)} 요청 실패 ({(int)statusCode})"); }
     }
 
     private async Task<string> GenerateAsync(string model, string apiKey, double temperature, object[] parts, CancellationToken token, bool jsonMode = false)
