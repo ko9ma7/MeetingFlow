@@ -92,9 +92,10 @@ dotnet run --project .\MeetingFlow.App\MeetingFlow.App.csproj
 릴리스 ZIP을 사용하는 경우 압축을 푼 폴더에서 Python 환경을 먼저 준비합니다.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-python.ps1
-.\MeetingFlow.exe
+powershell -ExecutionPolicy Bypass -File .\scripts\install-meetingflow.ps1 -SetUpPython
 ```
+
+위 명령은 `%LOCALAPPDATA%\Programs\MeetingFlow`에 최신 버전을 복사하고 바탕화면 `MeetingFlow` 바로가기를 갱신합니다. CrisperWhisper까지 사용할 때만 설치 폴더에서 `scripts\setup-python.ps1`을 별도로 실행합니다.
 
 자세한 사용 절차는 [사용 가이드](docs/USAGE.md)를 확인하세요.
 
@@ -123,7 +124,7 @@ API 키는 Windows 사용자 계정의 DPAPI로 암호화해 로컬에 저장합
 
 ## 현재 한계
 
-- 설치 프로그램과 자동 업데이트는 아직 제공하지 않습니다.
+- 로컬 설치 스크립트는 제공하지만 MSIX 설치 프로그램과 자동 업데이트는 아직 제공하지 않습니다.
 - 실시간 초안은 약 3초 단위로 앞에서부터 처리합니다. 36초 이상 밀리면 초과 구간은 원본 오디오에서 종료 후 확정합니다.
 - 화자 분리 결과의 A/B/C/D 라벨에 실제 이름을 나중에 연결하면 검토본, AI 보고서 입력, Markdown 내보내기에 함께 반영됩니다.
 - CrisperWhisper Windows CPU 처리는 모델·음성 길이에 따라 실시간보다 느릴 수 있습니다.

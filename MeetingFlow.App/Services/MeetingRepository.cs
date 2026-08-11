@@ -43,6 +43,7 @@ public sealed class MeetingRepository
                     record.RawTranscript = string.IsNullOrWhiteSpace(record.RawTranscript) ? record.Transcript : record.RawTranscript;
                     record.Transcript = string.IsNullOrWhiteSpace(record.Transcript) ? record.RawTranscript : record.Transcript;
                     var repaired = AiReportParser.TryRepair(record);
+                    repaired |= RepairIncompleteRecord(record);
                     record.AiNotesText = string.IsNullOrWhiteSpace(record.AiNotesText) ? BuildAiNotes(record.Summary) : record.AiNotesText;
                     var template = ReportTemplateCatalog.Get(record.ReportTemplateId);
                     record.ReportTemplateId = template.Id;
@@ -64,6 +65,26 @@ public sealed class MeetingRepository
         if (summary.Topics.Count > 0) parts.Add($"주요 안건{Environment.NewLine}{string.Join(Environment.NewLine, summary.Topics.Select(x => $"• {x}"))}");
         if (summary.Decisions.Count > 0) parts.Add($"결정사항{Environment.NewLine}{string.Join(Environment.NewLine, summary.Decisions.Select(x => $"• {x}"))}");
         return string.Join(Environment.NewLine + Environment.NewLine, parts);
+    }
+
+    private static bool RepairIncompleteRecord(MeetingRecord record)
+    {
+        var hasTranscript = !string.IsNullOrWhiteSpace(record.Transcript)
+            || !string.IsNullOrWhiteSpace(record.RawTranscript)
+            || !string.IsNullOrWhiteSpace(record.LiveDraftTranscript)
+            || record.TranscriptSegments.Count > 0;
+        if (hasTranscript) return false;
+
+        var hasAudio = !string.IsNullOrWhiteSpace(record.AudioPath) && File.Exists(record.AudioPath);
+        var expectedStatus = hasAudio
+            ? "STT 재처리 필요 · 저장된 오디오 있음"
+            : "복구 불가 · 전사와 원본 오디오 없음";
+        var expectedAiStatus = hasAudio ? "STT 재처리 필요" : "복구 불가";
+        if (string.Equals(record.ProcessingStatus, expectedStatus, StringComparison.Ordinal)
+            && string.Equals(record.AiStatus, expectedAiStatus, StringComparison.Ordinal)) return false;
+        record.ProcessingStatus = expectedStatus;
+        record.AiStatus = expectedAiStatus;
+        return true;
     }
 
     public void Delete(Guid id)

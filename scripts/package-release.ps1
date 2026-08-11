@@ -1,5 +1,5 @@
 param(
-    [string]$Version = '2.2.0'
+    [string]$Version = '2.2.1'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,11 +27,13 @@ $packageScripts = Join-Path $package 'scripts'
 $packageDocs = Join-Path $package 'docs'
 New-Item -ItemType Directory -Path $packageScripts,$packageDocs | Out-Null
 Copy-Item -LiteralPath (Join-Path $root 'scripts\setup-python.ps1') -Destination $packageScripts
+Copy-Item -LiteralPath (Join-Path $root 'scripts\install-meetingflow.ps1') -Destination $packageScripts
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $package
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $package
 Copy-Item -LiteralPath (Join-Path $root 'docs\USAGE.md') -Destination $packageDocs
 Copy-Item -LiteralPath (Join-Path $root 'docs\SPEAKER_DIARIZATION_SETUP.md') -Destination $packageDocs
-Copy-Item -LiteralPath (Join-Path $root 'docs\RELEASE_NOTES_2.2.0.md') -Destination $packageDocs
+Copy-Item -LiteralPath (Join-Path $root 'docs\STT_SERVICE_COMPARISON.md') -Destination $packageDocs
+Copy-Item -LiteralPath (Join-Path $root 'docs\RELEASE_NOTES_2.2.1.md') -Destination $packageDocs
 
 Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip -CompressionLevel Optimal
 Get-Item $zip

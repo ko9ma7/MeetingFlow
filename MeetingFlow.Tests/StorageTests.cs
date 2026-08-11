@@ -117,6 +117,27 @@ public sealed class StorageTests : IDisposable
     }
 
     [Fact]
+    public void Repository_MarksEmptyTranscriptWithSavedAudioAsRecoverable()
+    {
+        var audioPath = Path.Combine(_root, "recoverable.wav");
+        Directory.CreateDirectory(_root);
+        File.WriteAllBytes(audioPath, [0, 1, 2, 3]);
+        var repository = new MeetingRepository(_root);
+        repository.Save(new MeetingRecord
+        {
+            Title = "복구 회의",
+            AudioPath = audioPath,
+            ProcessingStatus = "AI 정리 대기",
+            AiStatus = "대기"
+        });
+
+        var loaded = Assert.Single(repository.LoadAll());
+
+        Assert.Equal("STT 재처리 필요 · 저장된 오디오 있음", loaded.ProcessingStatus);
+        Assert.Equal("STT 재처리 필요", loaded.AiStatus);
+    }
+
+    [Fact]
     public void ReportTemplates_ProvideReusableContentAwareFormats()
     {
         Assert.True(ReportTemplateCatalog.All.Count >= 12);

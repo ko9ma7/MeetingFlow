@@ -138,6 +138,8 @@ public partial class MainWindow : Window
         ReloadRecords();
         var version = Assembly.GetExecutingAssembly().GetName().Version;
         VersionText.Text = $"버전 {version?.Major}.{version?.Minor}.{version?.Build}";
+        SidebarVersionText.Text = $"v{version?.Major}.{version?.Minor}.{version?.Build}";
+        Title = $"MeetingFlow {version?.Major}.{version?.Minor}.{version?.Build}";
         _loadingSettings = false;
     }
 
@@ -317,13 +319,24 @@ public partial class MainWindow : Window
         selectedNav.Foreground = Brushes.White;
     }
 
-    private void HomeNav_Click(object sender, RoutedEventArgs e) => ShowPage(HomePage, "새 회의", HomeNav);
+    private void HomeNav_Click(object sender, RoutedEventArgs e)
+    {
+        ShowPage(HomePage, _activeRecord is null ? "새 회의" : "회의 진행", HomeNav);
+        WorkspaceTabs.SelectedIndex = 0;
+    }
     private void RecordsNav_Click(object sender, RoutedEventArgs e) { ReloadRecords(); ShowPage(RecordsPage, "회의 기록", RecordsNav); }
     private void SettingsNav_Click(object sender, RoutedEventArgs e) => ShowPage(SettingsPage, "설정", SettingsNav);
     private void AboutNav_Click(object sender, RoutedEventArgs e) => ShowPage(AboutPage, "앱 정보", AboutNav);
     private void ShowTranscriptReview_Click(object sender, RoutedEventArgs e) => ResultTabs.SelectedIndex = 0;
     private void ShowAiReport_Click(object sender, RoutedEventArgs e) => ResultTabs.SelectedIndex = 1;
     private void ShowSttComparison_Click(object sender, RoutedEventArgs e) => ResultTabs.SelectedIndex = 2;
+
+    private void BackToRecordingButton_Click(object sender, RoutedEventArgs e)
+    {
+        ShowPage(HomePage, _activeRecord is null ? "새 회의" : "회의 진행", HomeNav);
+        WorkspaceTabs.SelectedIndex = 0;
+        FooterStatus.Text = _isBusy ? "전사는 백그라운드에서 계속 진행 중입니다" : "녹음·가져오기 화면으로 돌아왔습니다";
+    }
 
     private void NewMeetingButton_Click(object sender, RoutedEventArgs e)
     {
@@ -356,6 +369,7 @@ public partial class MainWindow : Window
         ResultTabs.SelectedIndex = 0;
         FooterStatus.Text = "새 회의 준비됨";
         PrepareTimeline(string.Empty, TimeSpan.Zero);
+        ShowPage(HomePage, "새 회의", HomeNav);
     }
 
     private void CancelProcessingButton_Click(object sender, RoutedEventArgs e)
@@ -664,7 +678,7 @@ public partial class MainWindow : Window
             {
                 Id = checkpoint?.Id ?? Guid.NewGuid(),
                 Title = string.IsNullOrWhiteSpace(MeetingTitleBox.Text) ? $"회의 {DateTime.Now:yyyy-MM-dd HH:mm}" : MeetingTitleBox.Text.Trim(),
-                MeetingType = GetMeetingType(), StartedAt = _preparedAudioIsImported || _recordingStarted == default ? DateTime.Now : _recordingStarted,
+                MeetingType = GetMeetingType(), StartedAt = checkpoint?.StartedAt ?? (_preparedAudioIsImported || _recordingStarted == default ? DateTime.Now : _recordingStarted),
                 Duration = duration, AudioPath = audioPath, Transcript = transcript, RawTranscript = transcript,
                 LiveDraftTranscript = checkpoint?.LiveDraftTranscript ?? _liveDraftText.ToString(),
                 LiveDraftUpdatedAt = checkpoint?.LiveDraftUpdatedAt,
@@ -737,6 +751,12 @@ public partial class MainWindow : Window
         {
             ProgressText.Text = "작업을 취소했습니다.";
             FooterStatus.Text = "처리 취소됨";
+            if (_activeRecord is not null)
+            {
+                _activeRecord.ProcessingStatus = "STT 재처리 필요 · 사용자가 작업 취소";
+                _activeRecord.AiStatus = "STT 재처리 필요";
+                await Task.Run(() => _repository.Save(_activeRecord), CancellationToken.None);
+            }
         }
         catch (Exception ex)
         {
@@ -1356,8 +1376,52 @@ public partial class MainWindow : Window
         RecordRangeEndBox.Text = FormatClock(recordEnd);
         RecordInfoBox.Text = $"제목: {record.Title}\n회의·콘텐츠 유형: {record.MeetingType}\nSTT 콘텐츠 프로필: {record.ContentProfileName}\n시작: {record.StartedAt:yyyy-MM-dd HH:mm:ss}\n완료: {record.CompletedAt:yyyy-MM-dd HH:mm:ss}\n길이: {record.DurationText}\n녹음 소스: {record.AudioSource}\n처리 상태: {record.ProcessingStatus}\nSTT 엔진: {record.SttEngine}\nCPU 품질 프리셋: {SttQualityPresetCatalog.Get(record.SttQualityProfile).Name}\n정확도 모델: {record.SttModel}\n처리 속도: {(record.SttRealtimeFactor > 0 ? $"{record.SttRealtimeFactor:0.0}x 실시간 · {record.SttProcessingSeconds:0.0}초" : "기록 없음")}\n이중 전사 비교: {(string.IsNullOrWhiteSpace(record.SttComparisonSummary) ? "사용 안 함" : record.SttComparisonSummary)}\nSTT 경고: {(string.IsNullOrWhiteSpace(record.SttWarnings) ? "없음" : record.SttWarnings)}\n실시간 임시 자막 모델: {(string.IsNullOrWhiteSpace(record.LiveDraftModel) ? "사용 안 함" : record.LiveDraftModel)}\n전사 검토: {(record.TranscriptReviewed ? $"완료 ({record.TranscriptReviewedAt:yyyy-MM-dd HH:mm:ss})" : "대기")}\n화자 분리: {record.DiarizationStatus} · 방식 {record.SpeakerDiarizationMode} · 감지 {record.DetectedSpeakerCount}명\n화자 분리 진단: {(string.IsNullOrWhiteSpace(record.DiarizationWarning) ? "정상" : record.DiarizationWarning)}\n언어 방식: {record.LanguageMode}\n주 언어: {record.PrimaryLanguage}\n감지 언어: {(string.IsNullOrWhiteSpace(record.DetectedLanguage) ? "고정 또는 정보 없음" : $"{record.DetectedLanguage} ({record.DetectedLanguageProbability:P0})")}\n언어 진단: {(string.IsNullOrWhiteSpace(record.LanguageConstraintWarning) ? "정상" : record.LanguageConstraintWarning)}\n평균/최대 음량: {record.AudioRmsDb:0.0} / {record.AudioPeakDb:0.0} dBFS\n음질 진단: {(string.IsNullOrWhiteSpace(record.AudioQualityWarning) ? "정상" : record.AudioQualityWarning)}\n보고서 유형: {record.ReportTemplateName}\nAI 정리 수준: {record.AiOrganizationMode}\nAI 상태: {record.AiStatus}\nAI 시도 횟수: {record.AiAttemptCount}\nAI 적용 범위: {record.AiSourceRange}\n마지막 AI 오류: {(string.IsNullOrWhiteSpace(record.AiLastError) ? "없음" : record.AiLastError)}\n데이터 버전: {record.DataVersion}\n문자 인코딩: {record.TextEncoding}\n오디오: {record.AudioPath}{encodingWarning}";
         RecordInfoBox.Text += $"\n실시간 저장본: {record.LiveDraftTranscript.Length:N0}자 · 마지막 저장 {record.LiveDraftUpdatedAt:yyyy-MM-dd HH:mm:ss}\nAI 지침 버전: {record.AiPromptVersion}";
+        var availableTranscript = GetAvailableTranscript(record);
+        var hasAudio = File.Exists(record.AudioPath);
         RecordSummaryBox.Text = aiNotes;
-        RecordTranscriptBox.Text = string.IsNullOrWhiteSpace(record.Transcript) ? rawTranscript : record.Transcript;
+        RecordTranscriptBox.Text = string.IsNullOrWhiteSpace(availableTranscript)
+            ? hasAudio
+                ? "전사 데이터가 비어 있습니다. 아래 '저장된 오디오 재전사'를 누르면 원본 WAV에서 다시 복구합니다."
+                : "전사 데이터와 원본 오디오가 모두 없어 자동 복구할 수 없습니다."
+            : availableTranscript;
+        RetranscribeRecordButton.IsEnabled = hasAudio && !_isBusy;
+        RetranscribeRecordButton.ToolTip = hasAudio ? record.AudioPath : "저장된 원본 오디오를 찾을 수 없습니다";
+        EditRecordTranscriptButton.IsEnabled = !string.IsNullOrWhiteSpace(availableTranscript);
+        RegenerateAiButton.IsEnabled = !string.IsNullOrWhiteSpace(availableTranscript);
+    }
+
+    private async void RetranscribeRecordButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isBusy || RecordsList.SelectedItem is not MeetingRecord record) return;
+        if (string.IsNullOrWhiteSpace(record.AudioPath) || !File.Exists(record.AudioPath))
+        {
+            ShowError("원본 오디오를 찾을 수 없습니다", "이 기록에 연결된 오디오 파일이 이동되거나 삭제되었습니다.");
+            return;
+        }
+        try
+        {
+            var duration = record.Duration > TimeSpan.Zero ? record.Duration : AudioRecorder.GetAudioDuration(record.AudioPath);
+            _isDemoMode = false;
+            _activeRecord = record;
+            _preparedAudioIsImported = true;
+            MeetingTitleBox.Text = record.Title;
+            SelectMeetingType(record.ContentProfileId);
+            PrepareTimeline(record.AudioPath, duration);
+            TranscriptBox.Text = string.IsNullOrWhiteSpace(record.LiveDraftTranscript)
+                ? "저장된 원본 오디오에서 전사를 다시 시작합니다. 첫 확정 구간부터 이 화면에 순서대로 표시됩니다."
+                : record.LiveDraftTranscript;
+            TranscriptCount.Text = $"{(record.LiveDraftTranscript?.Length ?? 0):N0}자";
+            ReviewStatusText.Text = "복구 전사 시작 · 원본 오디오는 변경하지 않고 같은 기록을 갱신합니다";
+            LoadSpeakerNameBoxes(record);
+            ShowPage(HomePage, "저장된 오디오 복구", HomeNav);
+            WorkspaceTabs.SelectedIndex = 1;
+            ResultTabs.SelectedIndex = 0;
+            await ProcessAudioAsync(record.AudioPath, duration);
+        }
+        catch (Exception ex)
+        {
+            ShowError("저장된 오디오를 다시 처리할 수 없습니다", ex.Message);
+        }
     }
 
     private void EditRecordTranscriptButton_Click(object sender, RoutedEventArgs e)
@@ -1370,7 +1434,15 @@ public partial class MainWindow : Window
         _isDemoMode = false;
         ExitDemoButton.Visibility = Visibility.Collapsed;
         _activeRecord = record;
-        TranscriptBox.Text = string.IsNullOrWhiteSpace(record.Transcript) ? record.RawTranscript : record.Transcript;
+        var availableTranscript = GetAvailableTranscript(record);
+        if (string.IsNullOrWhiteSpace(availableTranscript))
+        {
+            ShowError("수정할 전사 데이터가 없습니다", File.Exists(record.AudioPath)
+                ? "'저장된 오디오 재전사'를 먼저 실행하세요."
+                : "전사 데이터와 원본 오디오를 모두 찾을 수 없습니다.");
+            return;
+        }
+        TranscriptBox.Text = availableTranscript;
         TranscriptBox.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#172033"));
         TranscriptCount.Text = $"{TranscriptBox.Text.Length:N0}자";
         SummaryBox.Text = string.IsNullOrWhiteSpace(record.AiNotesText) ? FormatSummary(record.Summary) : record.AiNotesText;
@@ -1381,6 +1453,22 @@ public partial class MainWindow : Window
         ShowPage(HomePage, "원문·화자 수정", HomeNav);
         WorkspaceTabs.SelectedIndex = 1;
         ResultTabs.SelectedIndex = 0;
+    }
+
+    private static string GetAvailableTranscript(MeetingRecord record)
+    {
+        if (!string.IsNullOrWhiteSpace(record.Transcript)) return record.Transcript;
+        if (!string.IsNullOrWhiteSpace(record.RawTranscript)) return record.RawTranscript;
+        return record.LiveDraftTranscript ?? string.Empty;
+    }
+
+    private void SelectMeetingType(string contentProfileId)
+    {
+        MeetingTypeBox.SelectedIndex = contentProfileId switch
+        {
+            "business" => 1, "media" => 2, "news" => 3, "technical" => 4,
+            "interview" => 5, "customer" => 6, "lecture" => 7, "legal" => 8, _ => 0
+        };
     }
 
     private void ExportButton_Click(object sender, RoutedEventArgs e)
