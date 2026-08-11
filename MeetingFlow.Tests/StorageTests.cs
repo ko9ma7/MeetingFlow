@@ -42,6 +42,20 @@ public sealed class StorageTests : IDisposable
     }
 
     [Fact]
+    public void Settings_Load_RepairsMissingLegacyValues()
+    {
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(Path.Combine(_root, "settings.json"), """{"AiProvider":null,"VadProfile":null,"CrisperChunkSeconds":0,"SpeakerCount":0}""");
+
+        var loaded = new SettingsService(_root).Load();
+
+        Assert.Equal("gemini", loaded.AiProvider);
+        Assert.Equal("balanced", loaded.VadProfile);
+        Assert.Equal(30, loaded.CrisperChunkSeconds);
+        Assert.Equal(2, loaded.SpeakerCount);
+    }
+
+    [Fact]
     public void Repository_SavesLoadsAndDeletesMeeting()
     {
         var repository = new MeetingRepository(_root);
@@ -70,6 +84,7 @@ public sealed class StorageTests : IDisposable
             SttProcessingSeconds = 12.3,
             SttRealtimeFactor = 2.1,
             TranscriptSegments = [new TranscriptSegment { Start = TimeSpan.Zero, End = TimeSpan.FromSeconds(3), Speaker = "A", Text = "회의 전사" }],
+            SpeakerNames = new Dictionary<string, string> { ["A"] = "김과장" },
             Summary = new MeetingSummary { Overview = "요약" }
         };
 
@@ -89,6 +104,7 @@ public sealed class StorageTests : IDisposable
         Assert.Equal("완료", loaded[0].DiarizationStatus);
         Assert.Equal(2, loaded[0].DetectedSpeakerCount);
         Assert.Equal("A", loaded[0].TranscriptSegments[0].Speaker);
+        Assert.Equal("김과장", loaded[0].SpeakerNames["A"]);
         Assert.Equal("cpu-accurate", loaded[0].SttQualityProfile);
         Assert.Equal("보조 회의 전사", loaded[0].SecondaryTranscript);
         Assert.Equal(2.1, loaded[0].SttRealtimeFactor);
@@ -195,6 +211,24 @@ public sealed class StorageTests : IDisposable
     public void LiveTranscriptSanitizer_RemovesLowInformationRepetition(string input, string expected)
     {
         Assert.Equal(expected, TranscriptTextSanitizer.SanitizeLiveSegment(input));
+    }
+
+    [Fact]
+    public void SpeakerLabels_ApplyNamesWithoutLosingStableIds()
+    {
+        var record = new MeetingRecord
+        {
+            Duration = TimeSpan.FromSeconds(10),
+            SpeakerNames = new Dictionary<string, string> { ["A"] = "김과장" },
+            TranscriptSegments = [new TranscriptSegment { Start = TimeSpan.Zero, End = TimeSpan.FromSeconds(10), Speaker = "A", Text = "일정을 확정합니다." }]
+        };
+
+        var formatted = SpeakerLabelService.Format(record);
+        var parsed = SpeakerLabelService.Parse(formatted, record.Duration, record.SpeakerNames);
+
+        Assert.Contains("화자 A(김과장):", formatted);
+        Assert.Equal("A", parsed[0].Speaker);
+        Assert.Equal("김과장", record.SpeakerNames["A"]);
     }
 
     [Fact]

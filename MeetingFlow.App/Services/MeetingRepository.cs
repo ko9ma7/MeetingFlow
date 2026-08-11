@@ -39,6 +39,7 @@ public sealed class MeetingRepository
                 var record = JsonSerializer.Deserialize<MeetingRecord>(File.ReadAllText(file), JsonOptions);
                 if (record is not null)
                 {
+                    record.SpeakerNames ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     record.RawTranscript = string.IsNullOrWhiteSpace(record.RawTranscript) ? record.Transcript : record.RawTranscript;
                     record.Transcript = string.IsNullOrWhiteSpace(record.Transcript) ? record.RawTranscript : record.Transcript;
                     var repaired = AiReportParser.TryRepair(record);

@@ -148,7 +148,7 @@ def record_audio(output: str, device: int | None, live_preview: bool = False) ->
             if preview_writer is not None:
                 preview_writer.writeframesraw(data)
                 preview_bytes += len(data)
-                if preview_bytes >= rate * channels * audio.get_sample_size(pyaudio.paInt16) * 4:
+                if preview_bytes >= rate * channels * audio.get_sample_size(pyaudio.paInt16) * 3:
                     complete_preview_chunk(True)
             samples = array("h", data)
             peak = max((abs(value) for value in samples), default=0) / 32768.0

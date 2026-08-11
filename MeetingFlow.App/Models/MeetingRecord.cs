@@ -2,7 +2,7 @@ namespace MeetingFlow.App.Models;
 
 public sealed class MeetingRecord
 {
-    public int DataVersion { get; set; } = 9;
+    public int DataVersion { get; set; } = 10;
     public Guid Id { get; set; } = Guid.NewGuid();
     public string Title { get; set; } = string.Empty;
     public string MeetingType { get; set; } = "일반 업무 회의";
@@ -17,6 +17,7 @@ public sealed class MeetingRecord
     public DateTime? TranscriptReviewedAt { get; set; }
     public string AiNotesText { get; set; } = string.Empty;
     public List<TranscriptSegment> TranscriptSegments { get; set; } = [];
+    public Dictionary<string, string> SpeakerNames { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public string SecondaryTranscript { get; set; } = string.Empty;
     public List<TranscriptSegment> SecondaryTranscriptSegments { get; set; } = [];
     public string SttComparisonSummary { get; set; } = string.Empty;

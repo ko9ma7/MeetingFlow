@@ -15,6 +15,7 @@ public sealed record LiveDraftSegment(TimeSpan Start, TimeSpan End, string Text)
 public sealed class PythonSttService : IDisposable
 {
     private const int MaxLiveChunkBacklog = 12;
+    private const int LiveChunkSeconds = 3;
     private readonly string _scriptPath;
     private readonly string _pythonPath;
     private readonly string _crisperPythonPath;
@@ -280,7 +281,7 @@ public sealed class PythonSttService : IDisposable
                     var speech = !root.TryGetProperty("speech", out var speechValue) || speechValue.GetBoolean();
                     var skipped = Volatile.Read(ref _liveChunksSkipped);
                     var state = speech ? $"앞에서부터 변환 중 · {rtf:0.0}x" : "무음·노이즈 구간 제외";
-                    var queue = pending > 0 ? $" · 대기 {pending}개({pending * 4}초)" : " · 실시간 동기화";
+                    var queue = pending > 0 ? $" · 대기 {pending}개({pending * LiveChunkSeconds}초)" : " · 실시간 동기화";
                     var recovery = skipped > 0 ? $" · 초과 {skipped}개는 종료 후 확정" : string.Empty;
                     LiveDraftStatusChanged?.Invoke(this, state + queue + recovery);
                 }
@@ -303,7 +304,7 @@ public sealed class PythonSttService : IDisposable
             Interlocked.Decrement(ref _liveChunkOutstanding);
             Interlocked.Increment(ref _liveChunksSkipped);
             TryDelete(path);
-            LiveDraftStatusChanged?.Invoke(this, "CPU 지연이 48초를 넘어 실시간 초안 한 구간을 미룸 · 녹음 원본은 보존되고 종료 후 자동 확정됩니다");
+            LiveDraftStatusChanged?.Invoke(this, "CPU 지연이 36초를 넘어 실시간 초안 한 구간을 미룸 · 녹음 원본은 보존되고 종료 후 자동 확정됩니다");
             return;
         }
         try { await _liveInputLock.WaitAsync(token); }

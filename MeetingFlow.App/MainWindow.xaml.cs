@@ -2,7 +2,6 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Reflection;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -40,6 +39,8 @@ public partial class MainWindow : Window
     private DateTime _lastSttCheckpointSavedAt;
     private string _lastLiveSegmentText = string.Empty;
     private bool _suppressLiveDraftSync;
+    private bool _loadingSettings;
+    private bool _isDemoMode;
     private readonly StringBuilder _sttDiagnostics = new();
     private string _lastSttLogMessage = string.Empty;
 
@@ -61,6 +62,7 @@ public partial class MainWindow : Window
 
     private void LoadAppState()
     {
+        _loadingSettings = true;
         _settings = _settingsService.Load();
         if (!_settings.SttQualityConfigured)
         {
@@ -136,6 +138,7 @@ public partial class MainWindow : Window
         ReloadRecords();
         var version = Assembly.GetExecutingAssembly().GetName().Version;
         VersionText.Text = $"버전 {version?.Major}.{version?.Minor}.{version?.Build}";
+        _loadingSettings = false;
     }
 
     private void RefreshApiStatus()
@@ -163,12 +166,14 @@ public partial class MainWindow : Window
                 ? "pyannote Community-1 엔진 설치됨 · Hugging Face 토큰 설정 후 사용 가능"
                 : "화자 분리는 선택 기능입니다 · pyannote.audio 설치와 Hugging Face 토큰이 필요합니다";
             FooterStatus.Text = "Python 로컬 음성 엔진 준비됨";
+            LiveDraftStatusText.Text = "실시간 엔진 준비 · 첫 문장 약 3초부터 순차 표시";
             AppendSttLog($"faster-whisper 준비 · Python {health.Python}");
         }
         catch (Exception ex)
         {
             _pythonReady = false;
             WhisperModelStatusText.Text = $"Python 엔진 미사용 · C# Whisper 폴백: {ex.Message}";
+            LiveDraftStatusText.Text = "실시간 엔진 미설치 · 설정에서 Python 엔진을 설치하세요";
             AppendSttLog($"faster-whisper 미사용 · {ex.Message}");
         }
         try
@@ -222,7 +227,24 @@ public partial class MainWindow : Window
         if (LiveDraftModelBox is not null)
             LiveDraftModelBox.SelectedIndex = preset.LiveModel switch { "small" => 2, "medium" => 3, _ => 1 };
         if (SttBeamSizeBox is not null) SttBeamSizeBox.Text = preset.BeamSize.ToString();
+        if (!_loadingSettings) _settingsService.Save(_settings);
+    }
+
+    private void HomeSettings_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_loadingSettings || HomeReportTemplateBox?.SelectedItem is not ReportTemplate template) return;
+        _settings.DefaultReportTemplateId = template.Id;
+        _settings.AiOrganizationMode = GetComboTag(HomeAiModeBox, "표준 회의록");
+        _settings.SpeakerDiarizationMode = GetComboTag(HomeSpeakerModeBox, "off");
+        _settings.SpeakerCount = ParseSpeakerCount(HomeSpeakerCountBox.Text);
+        HomeSpeakerCountBox.Text = _settings.SpeakerCount.ToString();
+        _settings.ContentProfile = GetContentProfileId();
         _settingsService.Save(_settings);
+        if (DefaultReportTemplateBox is not null) DefaultReportTemplateBox.SelectedItem = template;
+        if (AiModeBox is not null) AiModeBox.SelectedIndex = HomeAiModeBox.SelectedIndex;
+        if (SpeakerModeBox is not null) SpeakerModeBox.SelectedIndex = HomeSpeakerModeBox.SelectedIndex;
+        if (SpeakerCountBox is not null) SpeakerCountBox.Text = _settings.SpeakerCount.ToString();
+        FooterStatus.Text = "회의 설정을 자동 저장했습니다";
     }
 
     private string GetQualityHelp(SttQualityPreset preset) => $"{preset.Description} · {(_pythonStt.IsModelPrepared(preset.FinalModel) ? "모델 준비됨" : "첫 사용 시 자동 설치")}";
@@ -232,6 +254,7 @@ public partial class MainWindow : Window
         if (HomeReportTemplateBox is null || HomeReportTemplateBox.ItemsSource is null) return;
         var profile = TranscriptionProfileCatalog.Get(GetContentProfileId());
         HomeReportTemplateBox.SelectedItem = ReportTemplateCatalog.Get(profile.Id == "general" ? _settings.DefaultReportTemplateId : profile.RecommendedTemplateId);
+        if (!_loadingSettings) HomeSettings_Changed(sender, e);
     }
 
     private void UpdateAudioSourceUi()
@@ -310,6 +333,8 @@ public partial class MainWindow : Window
             return;
         }
 
+        _isDemoMode = false;
+        ExitDemoButton.Visibility = Visibility.Collapsed;
         MeetingTitleBox.Text = "새 회의";
         TimerText.Text = "00:00:00";
         TranscriptBox.Text = "녹음하거나 오디오 파일을 가져오면 로컬 STT 원문이 여기에 표시됩니다.";
@@ -326,6 +351,7 @@ public partial class MainWindow : Window
         LiveDraftBox.Text = "녹음을 시작하면 빠른 초안 모델이 말하는 내용을 구간별로 표시합니다.";
         LiveDraftStatusText.Text = "실시간 초안 대기";
         TranscriptCount.Text = "0자";
+        LoadSpeakerNameBoxes(null);
         WorkspaceTabs.SelectedIndex = 0;
         ResultTabs.SelectedIndex = 0;
         FooterStatus.Text = "새 회의 준비됨";
@@ -643,6 +669,7 @@ public partial class MainWindow : Window
                 LiveDraftTranscript = checkpoint?.LiveDraftTranscript ?? _liveDraftText.ToString(),
                 LiveDraftUpdatedAt = checkpoint?.LiveDraftUpdatedAt,
                 TranscriptSegments = localTranscript.Segments,
+                SpeakerNames = checkpoint?.SpeakerNames ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
                 SecondaryTranscript = secondaryTranscript?.Text ?? string.Empty,
                 SecondaryTranscriptSegments = secondaryTranscript?.Segments ?? [],
                 SttComparisonSummary = comparison?.Summary ?? string.Empty,
@@ -670,8 +697,12 @@ public partial class MainWindow : Window
                 ProcessingStatus = "STT 완료", CompletedAt = DateTime.Now, TextEncoding = "UTF-8",
                 AudioSource = _preparedAudioIsImported ? "오디오 파일 가져오기" : GetComboTag(AudioSourceBox, "microphone") == "loopback" ? "시스템 소리 (WASAPI 루프백)" : "마이크"
             };
+            record.Transcript = SpeakerLabelService.Format(record);
             await Task.Run(() => _repository.Save(record), token);
             _activeRecord = record;
+            TranscriptBox.Text = record.Transcript;
+            TranscriptCount.Text = $"{record.Transcript.Length:N0}자";
+            LoadSpeakerNameBoxes(record);
             SaveTranscriptButton.IsEnabled = true;
             GenerateAiButton.IsEnabled = aiMode != "사용 안 함";
             ReviewStatusText.Text = localTranscript.DiarizationStatus is "실패" or "미설치" or "미실행"
@@ -737,7 +768,7 @@ public partial class MainWindow : Window
             var sourceText = fullRange && !string.IsNullOrWhiteSpace(record.Transcript)
                 ? record.Transcript
                 : selectedSegments.Count > 0
-                    ? string.Join(Environment.NewLine, selectedSegments.Select(x => $"[{x.Timestamp}] {x.SpeakerPrefix}{x.Text}"))
+                    ? string.Join(Environment.NewLine, selectedSegments.Select(x => SpeakerLabelService.FormatSegment(record, x)))
                     : string.Empty;
             if (string.IsNullOrWhiteSpace(sourceText)) throw new InvalidOperationException("지정한 시간 범위에 전사 내용이 없습니다.");
             _settings.AiOrganizationMode = record.AiOrganizationMode;
@@ -815,33 +846,13 @@ public partial class MainWindow : Window
         var reviewedText = TranscriptBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(reviewedText)) throw new InvalidOperationException("검토한 원문이 비어 있습니다.");
         record.Transcript = reviewedText;
-        var parsedSegments = ParseReviewedSegments(reviewedText, record.Duration);
+        var parsedSegments = SpeakerLabelService.Parse(reviewedText, record.Duration, record.SpeakerNames);
         if (parsedSegments.Count > 0) record.TranscriptSegments = parsedSegments;
         record.TranscriptReviewed = true;
         record.TranscriptReviewedAt = DateTime.Now;
         if (record.AiStatus == "검토 대기") record.AiStatus = "준비됨";
         record.ProcessingStatus = "원문 검토 완료";
         await Task.Run(() => _repository.Save(record));
-    }
-
-    private static List<TranscriptSegment> ParseReviewedSegments(string transcript, TimeSpan duration)
-    {
-        var parsed = new List<TranscriptSegment>();
-        var pattern = new Regex(@"^\[(?<time>\d{1,2}:\d{2}(?::\d{2})?)\]\s*(?:화자\s+(?<speaker>[^:]+):\s*)?(?<text>.+)$");
-        foreach (var line in transcript.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var match = pattern.Match(line);
-            if (!match.Success || !TimeSpan.TryParse(match.Groups["time"].Value, out var start)) continue;
-            parsed.Add(new TranscriptSegment
-            {
-                Start = start,
-                Speaker = match.Groups["speaker"].Value.Trim(),
-                Text = match.Groups["text"].Value.Trim()
-            });
-        }
-        for (var i = 0; i < parsed.Count; i++)
-            parsed[i].End = i + 1 < parsed.Count ? parsed[i + 1].Start : duration > parsed[i].Start ? duration : parsed[i].Start + TimeSpan.FromSeconds(5);
-        return parsed;
     }
 
     private async Task<int> RetryPendingAiCoreAsync(CancellationToken token)
@@ -916,7 +927,22 @@ public partial class MainWindow : Window
 
     private void DemoButton_Click(object sender, RoutedEventArgs e)
     {
-        var transcript = "[00:00] 김과장: 신제품 출시 일정을 8월 12일로 확정하겠습니다.\n[00:12] 이대리: 제품 소개 자료 초안은 제가 7월 25일까지 작성하겠습니다.\n[00:25] 박팀장: 법무 검토 일정이 아직 미정입니다. 다음 회의 전까지 담당자를 확인해 주세요.\n[00:39] 김과장: 좋습니다. 다음 회의는 7월 28일 오전 10시로 잡겠습니다.";
+        _isDemoMode = true;
+        ExitDemoButton.Visibility = Visibility.Visible;
+        _activeRecord = new MeetingRecord
+        {
+            Title = "화자 이름 연결 체험",
+            Duration = TimeSpan.FromSeconds(50),
+            DetectedSpeakerCount = 3,
+            TranscriptSegments =
+            [
+                new TranscriptSegment { Start = TimeSpan.Zero, End = TimeSpan.FromSeconds(12), Speaker = "A", Text = "신제품 출시 일정을 8월 12일로 확정하겠습니다." },
+                new TranscriptSegment { Start = TimeSpan.FromSeconds(12), End = TimeSpan.FromSeconds(25), Speaker = "B", Text = "제품 소개 자료 초안은 제가 7월 25일까지 작성하겠습니다." },
+                new TranscriptSegment { Start = TimeSpan.FromSeconds(25), End = TimeSpan.FromSeconds(39), Speaker = "C", Text = "법무 검토 일정이 아직 미정입니다. 다음 회의 전까지 담당자를 확인해 주세요." },
+                new TranscriptSegment { Start = TimeSpan.FromSeconds(39), End = TimeSpan.FromSeconds(50), Speaker = "A", Text = "좋습니다. 다음 회의는 7월 28일 오전 10시로 잡겠습니다." }
+            ]
+        };
+        var transcript = SpeakerLabelService.Format(_activeRecord);
         var summary = new MeetingSummary
         {
             Overview = "신제품 출시 일정과 준비 업무를 점검했습니다. 출시일은 8월 12일로 확정되었고, 소개 자료와 법무 검토가 후속 과제로 남았습니다.",
@@ -927,10 +953,58 @@ public partial class MainWindow : Window
         };
         TranscriptBox.Text = transcript; TranscriptBox.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#172033")); TranscriptCount.Text = $"{transcript.Length:N0}자";
         SummaryBox.Text = FormatSummary(summary); SummaryBox.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#172033"));
+        LoadSpeakerNameBoxes(_activeRecord);
+        SpeakerMappingStatusText.Text = "A/B/C에 이름을 넣고 적용해 보세요 · 체험 종료 버튼으로 즉시 돌아갈 수 있습니다";
         WorkspaceTabs.SelectedIndex = 1;
         ResultTabs.SelectedIndex = 0;
         FooterStatus.Text = "데모 데이터가 준비되었습니다";
     }
+
+    private async void ApplySpeakerNamesButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_activeRecord is null)
+        {
+            ShowError("적용할 전사가 없습니다", "먼저 회의를 전사하거나 화면 체험을 실행하세요.");
+            return;
+        }
+
+        var parsed = SpeakerLabelService.Parse(TranscriptBox.Text, _activeRecord.Duration, _activeRecord.SpeakerNames);
+        if (parsed.Count > 0) _activeRecord.TranscriptSegments = parsed;
+        SetSpeakerName(_activeRecord, "A", SpeakerANameBox.Text);
+        SetSpeakerName(_activeRecord, "B", SpeakerBNameBox.Text);
+        SetSpeakerName(_activeRecord, "C", SpeakerCNameBox.Text);
+        SetSpeakerName(_activeRecord, "D", SpeakerDNameBox.Text);
+        _activeRecord.Transcript = SpeakerLabelService.Format(_activeRecord);
+        TranscriptBox.Text = _activeRecord.Transcript;
+        TranscriptCount.Text = $"{_activeRecord.Transcript.Length:N0}자";
+        if (!string.IsNullOrWhiteSpace(_activeRecord.AiNotesText))
+        {
+            _activeRecord.AiStatus = "재정리 필요";
+            _activeRecord.ProcessingStatus = "화자 이름 변경 · AI 재정리 필요";
+            GenerateAiButton.IsEnabled = _activeRecord.AiOrganizationMode != "사용 안 함";
+            SpeakerMappingStatusText.Text = "이름 적용 완료 · 기존 AI 보고서는 아래 버튼으로 다시 생성하세요";
+        }
+        else SpeakerMappingStatusText.Text = "이름 적용 완료 · 이후 AI 보고서와 내보내기에도 같은 이름이 사용됩니다";
+        if (!_isDemoMode) await Task.Run(() => _repository.Save(_activeRecord));
+    }
+
+    private static void SetSpeakerName(MeetingRecord record, string label, string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) record.SpeakerNames.Remove(label);
+        else record.SpeakerNames[label] = name.Trim();
+    }
+
+    private void LoadSpeakerNameBoxes(MeetingRecord? record)
+    {
+        SpeakerANameBox.Text = GetSpeakerName(record, "A");
+        SpeakerBNameBox.Text = GetSpeakerName(record, "B");
+        SpeakerCNameBox.Text = GetSpeakerName(record, "C");
+        SpeakerDNameBox.Text = GetSpeakerName(record, "D");
+        SpeakerMappingStatusText.Text = record is null ? "빈칸은 A/B/C/D 라벨을 유지합니다" : "이름을 입력하면 모든 같은 화자 라벨에 한 번에 적용됩니다";
+    }
+
+    private static string GetSpeakerName(MeetingRecord? record, string label) =>
+        record is not null && record.SpeakerNames.TryGetValue(label, out var name) ? name : string.Empty;
 
     private void ResetRecordingControls()
     {
@@ -1284,6 +1358,29 @@ public partial class MainWindow : Window
         RecordInfoBox.Text += $"\n실시간 저장본: {record.LiveDraftTranscript.Length:N0}자 · 마지막 저장 {record.LiveDraftUpdatedAt:yyyy-MM-dd HH:mm:ss}\nAI 지침 버전: {record.AiPromptVersion}";
         RecordSummaryBox.Text = aiNotes;
         RecordTranscriptBox.Text = string.IsNullOrWhiteSpace(record.Transcript) ? rawTranscript : record.Transcript;
+    }
+
+    private void EditRecordTranscriptButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (RecordsList.SelectedItem is not MeetingRecord record)
+        {
+            ShowError("수정할 회의를 선택하세요", "왼쪽 목록에서 회의 기록을 먼저 선택하세요.");
+            return;
+        }
+        _isDemoMode = false;
+        ExitDemoButton.Visibility = Visibility.Collapsed;
+        _activeRecord = record;
+        TranscriptBox.Text = string.IsNullOrWhiteSpace(record.Transcript) ? record.RawTranscript : record.Transcript;
+        TranscriptBox.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#172033"));
+        TranscriptCount.Text = $"{TranscriptBox.Text.Length:N0}자";
+        SummaryBox.Text = string.IsNullOrWhiteSpace(record.AiNotesText) ? FormatSummary(record.Summary) : record.AiNotesText;
+        LoadSpeakerNameBoxes(record);
+        SaveTranscriptButton.IsEnabled = true;
+        GenerateAiButton.IsEnabled = record.AiOrganizationMode != "사용 안 함";
+        ReviewStatusText.Text = "저장된 회의의 원문과 화자 이름을 수정하고 다시 저장할 수 있습니다";
+        ShowPage(HomePage, "원문·화자 수정", HomeNav);
+        WorkspaceTabs.SelectedIndex = 1;
+        ResultTabs.SelectedIndex = 0;
     }
 
     private void ExportButton_Click(object sender, RoutedEventArgs e)

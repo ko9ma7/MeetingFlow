@@ -1,5 +1,5 @@
 param(
-    [string]$Version = '2.1.0'
+    [string]$Version = '2.2.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,6 +31,7 @@ Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $package
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $package
 Copy-Item -LiteralPath (Join-Path $root 'docs\USAGE.md') -Destination $packageDocs
 Copy-Item -LiteralPath (Join-Path $root 'docs\SPEAKER_DIARIZATION_SETUP.md') -Destination $packageDocs
+Copy-Item -LiteralPath (Join-Path $root 'docs\RELEASE_NOTES_2.2.0.md') -Destination $packageDocs
 
 Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip -CompressionLevel Optimal
 Get-Item $zip
